@@ -1,7 +1,14 @@
 import pytest
 
 from argus.desktop import ArgusError
-from argus.install import _load_jsonc
+from argus.install import _load_jsonc, is_temporary
+
+
+def test_temporary_install_locations_are_refused():
+    assert is_temporary(r"C:\Users\a\AppData\Local\uv\cache\archive-v0\x\Scripts\argus-mcp.exe")
+    assert is_temporary("C:/Users/a/AppData/Local/Temp/x/argus-mcp.exe")
+    assert not is_temporary(r"C:\Users\a\.local\bin\argus-mcp.exe")
+    assert not is_temporary(r"D:\code\argus\.venv\Scripts\argus-mcp.exe")
 
 
 def test_jsonc_with_comments_and_trailing_commas(tmp_path):

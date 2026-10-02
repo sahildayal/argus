@@ -314,8 +314,25 @@ def _selected(args) -> list[Client]:
     return [c for c in CLIENTS if c.detect()]
 
 
+def is_temporary(path: str) -> bool:
+    """True for uvx's cache and temp folders: registrations pointing there break
+    as soon as uv cleans up."""
+    p = path.lower().replace("/", "\\")
+    return "\\uv\\cache\\" in p or "\\appdata\\local\\temp\\" in p
+
+
 def install(args) -> int:
     server = entry_point("argus-mcp")
+    if is_temporary(server):
+        message = (
+            f"argus-mcp is running from a temporary location ({server}), probably through uvx. AI tools "
+            "registered to it would break when uv cleans its cache. Install Argus permanently first:\n"
+            "  uv tool install git+https://github.com/sahildayal/argus --managed-python --python 3.13\n"
+            "and then run `argus install` again."
+        )
+        if not args.dry_run:
+            raise ArgusError(message)
+        print(f"WARNING: {message}\n")
     allow = args.trust  # default: each AI tool keeps asking before a capture
     print(f"Argus MCP server: {server}")
     failures = 0
