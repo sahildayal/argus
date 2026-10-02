@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+
+# Never commit anyone's captures, marks, baselines, logs or settings
+# (they live in ~/.argus, but ARGUS_HOME can point anywhere).
+.argus/
+captures/
+marks/
+baselines/
+logs/
+*.bak-argus-*
+.env

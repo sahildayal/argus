@@ -1,0 +1,63 @@
+[project]
+name = "argus-screens"
+version = "0.1.0"
+description = "Multi-monitor screenshot MCP server and CLI for Windows: lets Claude and other AI tools see what you're looking at."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Sahil Dayal" }]
+keywords = ["mcp", "model-context-protocol", "screenshot", "multi-monitor", "windows", "claude", "ocr", "ai-tools"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Win32 (MS Windows)",
+  "Intended Audience :: Developers",
+  "Operating System :: Microsoft :: Windows :: Windows 10",
+  "Operating System :: Microsoft :: Windows :: Windows 11",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Graphics :: Capture :: Screen Capture",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = [
+  "mcp>=2.2,<3",
+  "mss>=10.2",
+  "pillow>=12.0",
+  "psutil>=7.0",
+  "pystray>=0.19.5",
+  "winrt-runtime>=3.2",
+  "winrt-Windows.Foundation>=3.2",
+  "winrt-Windows.Foundation.Collections>=3.2",
+  "winrt-Windows.Globalization>=3.2",
+  "winrt-Windows.Graphics.Imaging>=3.2",
+  "winrt-Windows.Media.Ocr>=3.2",
+  "winrt-Windows.Storage.Streams>=3.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/sahildayal/argus"
+Issues = "https://github.com/sahildayal/argus/issues"
+
+[project.scripts]
+argus = "argus.cli:main"
+argus-mcp = "argus.server:main"
+
+[project.gui-scripts]
+argus-tray = "argus.tray:main"
+
+[dependency-groups]
+dev = ["pytest>=9"]
+
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv]
+python-preference = "only-managed"
+
+[tool.uv.build-backend]
+module-name = "argus"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

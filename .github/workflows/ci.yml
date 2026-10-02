@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+      - name: Install
+        run: uv sync --locked
+      - name: Unit tests (fake desktops; live tests need a real one)
+        run: uv run pytest -q
+      - name: CLI smoke test
+        run: |
+          uv run argus --version
+          uv run argus status
