@@ -54,3 +54,13 @@ change capture, OCR, tray or server code.
 | `store.py` | capture registry, background PNG writes |
 | `service.py` | everything the tools do; `server.py` (MCP), `cli.py` and `tray.py` are thin front ends |
 | `install.py` | registering with AI tools, startup shortcut, `doctor` |
+
+## Releasing
+
+1. Bump `version` in `pyproject.toml` (and `src/argus/__init__.py`), then commit.
+2. Publish a GitHub release tagged `vX.Y.Z` (for example `gh release create v0.2.0 --generate-notes`).
+3. The `Publish to PyPI` workflow checks that the tag matches the version, runs the tests, builds,
+   and uploads with PyPI Trusted Publishing. No API token is stored anywhere.
+
+The demo GIF is regenerated with `uv run python docs/make_demo.py`. It opens its own demo windows and
+captures only those. Pass `--ask-claude` to refresh the cached Claude reply.

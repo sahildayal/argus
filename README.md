@@ -1,13 +1,18 @@
 # Argus
 
 [![CI](https://github.com/sahildayal/argus/actions/workflows/ci.yml/badge.svg)](https://github.com/sahildayal/argus/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/argus-screens.svg)](https://pypi.org/project/argus-screens/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/sahildayal/argus/blob/main/LICENSE)
 
 Eyes for your AI tools across every monitor. Argus is an MCP server (plus a CLI and
 a tray app) for Windows that lets Claude Code, Claude Desktop, VS Code, Codex,
 Gemini CLI, Antigravity and other MCP clients see your screens. That covers the
 window you're looking at, any monitor, any window or any region, at full
 resolution when it matters.
+
+![Argus demo: an AI looks at a broken checkout page, zooms into the error by grid cell, and a password manager is blacked out before the capture is sent](https://raw.githubusercontent.com/sahildayal/argus/main/docs/demo.gif)
+
+<sub>Built from real Argus output on demo windows and a real Claude reply ([how](https://github.com/sahildayal/argus/blob/main/docs/make_demo.py)).</sub>
 
 > Named after Argus Panoptes, the hundred-eyed giant: one eye per monitor.
 
@@ -31,10 +36,13 @@ You need **Windows 10 (1903+) or 11**, [uv](https://docs.astral.sh/uv/getting-st
 and at least one MCP-capable AI tool.
 
 ```powershell
-uv tool install git+https://github.com/sahildayal/argus --managed-python --python 3.13
+uv tool install argus-screens --managed-python --python 3.13
 argus install      # registers Argus with the AI tools it finds; starts the tray app with Windows
 argus doctor       # checks monitors, OCR, the tray and each registration
 ```
+
+To run the latest unreleased code, install from GitHub instead:
+`uv tool install git+https://github.com/sahildayal/argus --managed-python --python 3.13`.
 
 Then open a **new** session in your AI tool and say *"look at what I'm looking at"*.
 Running sessions don't pick up new MCP servers, and Claude Desktop needs a quit and reopen.
@@ -63,7 +71,7 @@ server that runs `argus-mcp`. Use the full path, which `where.exe argus-mcp` pri
 { "mcpServers": { "argus": { "command": "C:\\Users\\YOU\\.local\\bin\\argus-mcp.exe" } } }
 ```
 
-**Updating:** re-run the install command with `--reinstall`.
+**Updating:** `uv tool upgrade argus-screens` (for a GitHub install, re-run the install command with `--reinstall`).
 
 > Use a uv-managed Python (the `--managed-python` flag), not the Microsoft Store one:
 > Store Python silently redirects writes under `AppData` into a private sandbox, so
@@ -199,10 +207,10 @@ uv tool uninstall argus-screens
 
 ## Contributing
 
-Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+Issues and pull requests are welcome. See [CONTRIBUTING.md](https://github.com/sahildayal/argus/blob/main/CONTRIBUTING.md) for
 setup, the two test suites, and the ground rules (tests never capture the real
 screen; privacy defaults stay conservative).
 
 ## License
 
-[MIT](LICENSE)
+[MIT](https://github.com/sahildayal/argus/blob/main/LICENSE)

@@ -1,0 +1,35 @@
+name: Publish to PyPI
+
+# Runs when a GitHub release is published (tag vX.Y.Z matching pyproject's version).
+# Uses PyPI Trusted Publishing: no API token is stored anywhere.
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/argus-screens/
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0  # setup-uv publishes full version tags only
+      - name: Tag must match the package version
+        shell: bash
+        run: |
+          version="v$(uv version --short)"
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Release tag $GITHUB_REF_NAME doesn't match pyproject version $version"; exit 1
+          fi
+      - name: Test
+        run: |
+          uv sync --locked
+          uv run pytest -q
+      - name: Build
+        run: uv build
+      - name: Publish
+        run: uv publish --trusted-publishing always

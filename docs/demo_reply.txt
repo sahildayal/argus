@@ -1,0 +1,1 @@
+The order total shows NaN because updateTotals throws a TypeError at checkout.js:42, reading 'total' of an undefined object, and the Pay now button also overlaps the card number field. The likely fix is to guard against the missing cart or pricing object (for example, check it exists before reading .total) and to correct the button's positioning in the CSS.

@@ -327,7 +327,7 @@ def install(args) -> int:
         message = (
             f"argus-mcp is running from a temporary location ({server}), probably through uvx. AI tools "
             "registered to it would break when uv cleans its cache. Install Argus permanently first:\n"
-            "  uv tool install git+https://github.com/sahildayal/argus --managed-python --python 3.13\n"
+            "  uv tool install argus-screens --managed-python --python 3.13\n"
             "and then run `argus install` again."
         )
         if not args.dry_run:
