@@ -18,7 +18,8 @@ from .config import home
 from .config import Settings
 from .desktop import ArgusError, Paused, PolicyChanged
 from .geometry import Rect
-from .store import meta, open_file, png_info, replayable
+from .errors import work_profile
+from .store import meta, open_file, png_info, replayable, work_replay_path
 from .text import display_arg
 
 # ---------------------------------------------------------------------- diff
@@ -149,12 +150,15 @@ def save_baseline(name: str, shot: Shot) -> Path:
 
 def load_baseline(name: str, s: Settings | None = None) -> Shot:
     path = _baseline_path(name)
+    work = s.work if s is not None else work_profile()
+    if work:
+        path = work_replay_path(path)
     if not path.exists():
         rows, hidden = baselines(s)
         names = ", ".join(n for n, *_ in rows) or "none yet"
         more = f" ({hidden} more hidden: not saved under the current work profile)" if hidden else ""
         raise ArgusError(f"No baseline named {display_arg(name)!r}. Saved baselines: {names}{more}.")
-    shot = open_file(path)
+    shot = open_file(path, work=work)
     shot.kind = "baseline"
     return shot
 

@@ -245,6 +245,8 @@ GetForegroundWindow = _fn(user32, "GetForegroundWindow", HWND)
 WindowFromPoint = _fn(user32, "WindowFromPoint", HWND, POINT)
 GetCursorPos = _fn(user32, "GetCursorPos", wintypes.BOOL, ctypes.POINTER(POINT))
 GetWindowRect = _fn(user32, "GetWindowRect", wintypes.BOOL, HWND, ctypes.POINTER(RECT))
+GetWindowRgnBox = _fn(user32, "GetWindowRgnBox", ctypes.c_int, HWND, ctypes.POINTER(RECT))
+GetDriveTypeW = _fn(kernel32, "GetDriveTypeW", wintypes.UINT, wintypes.LPCWSTR)
 GetLayeredWindowAttributes = _fn(
     user32,
     "GetLayeredWindowAttributes",
@@ -379,6 +381,20 @@ def window_rect(hwnd: int) -> Rect:
     r = RECT()
     GetWindowRect(hwnd, ctypes.byref(r))
     return r.to_rect()
+
+
+def window_region(hwnd: int, frame: Rect) -> tuple[int, Rect, bool] | None:
+    """Region type, bounds in window coordinates, and whether it covers the whole window."""
+    bounds = RECT()
+    ctypes.set_last_error(0)
+    kind = GetWindowRgnBox(hwnd, ctypes.byref(bounds))
+    # ERROR with no last error is also how Windows reports a default region.
+    if not kind and not ctypes.get_last_error():
+        return None
+    box = bounds.to_rect()
+    full = window_rect(hwnd) if kind == 2 else None  # SIMPLEREGION
+    covers_frame = bool(full and full.intersect(frame) == frame and box == Rect(0, 0, full.w, full.h))
+    return kind, box, covers_frame
 
 
 def frame_rect(hwnd: int) -> Rect:

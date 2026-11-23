@@ -72,7 +72,7 @@ def test_audit_fields_and_format(tmp_path):
     assert record["image_sha256"] == [hashlib.sha256(shot_bytes).hexdigest()]
     assert record["text_chars"] == len(caption_text)
     assert record["request_id"] == decision.request_id
-    assert record["client"] == "test-client-suite"
+    assert record["client"] == "other:" + hashlib.sha256(b"test-client-suite").hexdigest()[:8]
     assert record["argus_version"] == __version__
     assert record["prev"] == "genesis"
     assert record["ts"].endswith("Z")
@@ -134,7 +134,8 @@ def test_audit_never_writes_sensitive_data(tmp_path, monkeypatch):
     entries = audit.read_entries(limit=None)
     assert [e["tool"] for e in entries] == ["screenshot", "read_text", "screenshot"]
     assert [e["request_id"] for e in entries] == [p.request_id for p in seen]
-    assert all(e["profile"] == "work" and e["client"] == "audit-testclient" for e in entries)
+    expected_client = "other:" + hashlib.sha256(b"audit-test\nclient").hexdigest()[:8]
+    assert all(e["profile"] == "work" and e["client"] == expected_client for e in entries)
     assert [e["images"] for e in entries] == [1, 0, 0]
     assert entries[0]["image_sha256"] == [hashlib.sha256(base64.b64decode(image)).hexdigest()]
     assert gate.request("other", required=False).approved
@@ -541,17 +542,24 @@ def test_audit_append_writes_once_then_syncs(monkeypatch):
         m.setattr(audit.os, "write", track_write)
         m.setattr(audit.os, "fsync", track_sync)
         audit.log_decision(_decision())
-    line, sync = writes
-    assert sync == "fsync" and line.endswith(b"\n") and b"\r" not in line
+    line, line_sync, head_sync = writes
+    assert line_sync == head_sync == "fsync" and line.endswith(b"\n") and b"\r" not in line
     assert json.loads(line)["prev"] == "genesis"
 
 
-def test_client_name_is_printable_bounded_and_ascii_encoded():
-    audit.log_decision(_decision(), client="é\n\ud800\u202e\u200b\ufe0f\u034f" + "x" * 1000)
+@pytest.mark.parametrize(("name", "product"), [
+    ("CLAUDE-Code / private workspace", "claude-code"),
+    ("Visual Studio CODE: sensitive title", "vscode"),
+    ("Claude Desktop internal", "claude-desktop"),
+    ("é\n\ud800\u202e\u200b\ufe0f\u034f" + "x" * 1000, None),
+])
+def test_client_name_never_copies_self_reported_text(name, product):
+    audit.log_decision(_decision(), client=name)
     (path,) = (home() / "audit").glob("audit-*.jsonl")
     raw = path.read_bytes()
     assert raw.isascii() and raw.count(b"\n") == 1
-    assert json.loads(raw)["client"] == "é" + "x" * 63
+    expected = product or "other:" + hashlib.sha256(name.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    assert json.loads(raw)["client"] == expected
 
 
 def test_audit_fails_closed_without_os_lock(monkeypatch):
@@ -572,9 +580,71 @@ def test_audit_uses_start_profile_after_policy_change():
         return "user"
 
     decision = gate.request("screenshot", (b"img",), start=start, transport=approve)
-    assert not decision.approved and decision.reason == "denied"
+    assert not decision.approved and decision.reason == "settings_changed"
     (entry,) = audit.read_entries()
-    assert entry["profile"] == "work" and entry["reason"] == "denied"
+    assert entry["profile"] == "work" and entry["reason"] == "settings_changed"
+
+
+@pytest.mark.parametrize("change", ["pause", "marker"])
+def test_audit_revalidates_approval_after_writing(monkeypatch, change):
+    from argus import config
+
+    set_profile("work")
+    log_decision = audit.log_decision
+
+    def log_then_change(decision, **kwargs):
+        record = log_decision(decision, **kwargs)
+        if decision.approved:
+            if change == "pause":
+                privacy.pause()
+            else:
+                config.write_profile_state("personal")
+        return record
+
+    monkeypatch.setattr(audit, "log_decision", log_then_change)
+    decision = gate.request("look", (b"img",), transport=lambda _: "user")
+    assert not decision.approved and decision.reason == "settings_changed"
+    with pytest.raises(gate.GateStopped, match="Argus settings changed during the call"):
+        gate.require(decision)
+    first, second = audit.read_entries()
+    assert first["request_id"] == second["request_id"] == decision.request_id
+    assert (first["decision"], first["reason"], first["images"]) == ("sent", "user", 1)
+    assert (second["decision"], second["reason"], second["images"]) == ("denied", "settings_changed", 0)
+    assert audit.verify_chain()[0]
+
+
+@pytest.mark.parametrize("remove_whole_file", [False, True])
+def test_head_detects_loss_of_whole_records(remove_whole_file):
+    audit.log_decision(_decision())
+    audit.log_decision(_decision())
+    base = home() / "audit"
+    (path,) = base.glob("audit-*.jsonl")
+    first, last = path.read_bytes().splitlines()
+    head = json.loads((base / "head.json").read_bytes())
+    assert head == {"hash": hashlib.sha256(last).hexdigest(), "count": 2, "ts": json.loads(last)["ts"]}
+    if remove_whole_file:
+        path.unlink()
+    else:
+        path.write_bytes(first + b"\n")
+    assert audit.verify_chain() == (False, "Audit tail missing/truncated.")
+    with pytest.raises(ValueError, match="tail missing/truncated"):
+        audit.log_decision(_decision())
+
+
+def test_append_recovers_when_head_replace_was_interrupted(monkeypatch):
+    audit.log_decision(_decision())
+
+    def crash(*_args):
+        raise OSError("interrupted checkpoint write")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(audit, "_write_head", crash)
+        with pytest.raises(OSError, match="interrupted checkpoint"):
+            audit.log_decision(_decision())
+    assert not audit.verify_chain()[0]
+    audit.log_decision(_decision())
+    assert audit.verify_chain()[0]
+    assert json.loads((home() / "audit" / "head.json").read_bytes())["count"] == 3
 
 
 def test_export_protects_audit_files_and_reports_unparseable_lines(tmp_path, capsys):

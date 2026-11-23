@@ -116,7 +116,7 @@ def test_trust_and_in_flight_approval_are_invalid_after_state_change(change):
         assert trust.windows is None
         return "user"
 
-    assert gate.request("look", windows=WINDOWS, start=current, transport=transport).reason == "denied"
+    assert gate.request("look", windows=WINDOWS, start=current, transport=transport).reason == "settings_changed"
 
 
 def test_display_arg_drops_invisible_fillers_and_mark_floods():
@@ -125,3 +125,17 @@ def test_display_arg_drops_invisible_fillers_and_mark_floods():
     assert display_arg(fillers + "ok") == "ok"
     flood = display_arg("a" + "\u0301" * 150)
     assert flood.startswith("\u00e1") and len(flood) <= 3
+
+
+def test_stamp_includes_policy_hash_even_without_file_revision_change(monkeypatch):
+    from argus import config
+
+    set_profile("work")
+    original = config.settings()
+    changed = replace(original, allow_apps=frozenset({"code.exe"}))
+    monkeypatch.setattr(gate, "settings", lambda: original)
+    start = gate.policy()
+    monkeypatch.setattr(gate, "settings", lambda: changed)
+    assert gate.policy().stamp[:-1] == start.stamp[:-1]
+    assert gate.policy().stamp[-1] != start.stamp[-1]
+    assert gate.policy_changed(start)

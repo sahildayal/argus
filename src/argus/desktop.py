@@ -117,6 +117,7 @@ class Window:
     # Every owner up the chain, nearest first: (HWND, PID), invisible owners
     # included. Empty means "only *owner* is known" (hand-made windows).
     owner_chain: tuple[tuple[int, int], ...] = ()
+    region: tuple[int, Rect, bool] | None = None  # region type, bounds, covers full window
 
     @property
     def app_process_id(self) -> int:
@@ -130,10 +131,10 @@ class Window:
 
     @property
     def opaque(self) -> bool:
-        """Provably opaque: not layered, or layered with constant alpha 255 and
-        no colour key. A per-pixel-alpha window (UpdateLayeredWindow) never is:
-        whatever is behind it may show through."""
-        return not self.layered or (self.alpha == 255 and not self.colorkey)
+        """Whether the region fills the window and its pixels are provably opaque."""
+        return (self.region is None or self.region[2]) and (
+            not self.layered or (self.alpha == 255 and not self.colorkey)
+        )
 
     @property
     def handle(self) -> str:
@@ -463,7 +464,7 @@ def snapshot(host: Host | None = None) -> Desktop:
             minimized=minimized, maximized=bool(win32.IsZoomed(h)), topmost=bool(ex & win32.WS_EX_TOPMOST),
             see_through=see_through, is_app=is_app, owner=own, monitor=mon,
             alpha=alpha, rect_exact=exact, app_pid=app_pid, attributed=attributed,
-            layered=layered, colorkey=colorkey, owner_chain=chain,
+            layered=layered, colorkey=colorkey, owner_chain=chain, region=win32.window_region(h, rect),
         )
         layers.append(_with_host(w, host))
     return Desktop(tuple(monitors), tuple(layers), cursor, fg, under, host, time.time(), refresh=lambda: snapshot(host))

@@ -324,11 +324,12 @@ def work_mask(region: Rect, desk: Desktop, s: Settings) -> tuple[Image.Image, se
         if w.hwnd in reveal and w.rect_exact and w.opaque:
             _reveal(draw, w, region, desk)
         else:
-            # A translucent or per-pixel-alpha window is blacked out whole, so
-            # nothing beneath it can show through, whatever is there.
+            # Hide the whole rectangle when we can't prove it covers the pixels beneath it.
             draw.rectangle(local(inter), fill=255)
             if w.hwnd in reveal and not w.rect_exact:
                 blocked.add("a window whose exact position Windows didn't report")
+            elif w.hwnd in reveal and w.region is not None and not w.region[2]:
+                blocked.add("a window whose region doesn't provably cover its rectangle")
             elif w.hwnd in reveal:
                 blocked.add("a translucent window (Argus can't prove nothing shows through it)")
             elif w.see_through:

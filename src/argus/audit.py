@@ -34,6 +34,22 @@ _MONTH = r"[0-9]{4}-(?:0[1-9]|1[0-2])"
 _MONTHLY_FILE = re.compile(rf"audit-({_MONTH})\.jsonl")
 _ANCHOR_FILE = "anchor.json"
 _PENDING_ANCHOR = "anchor.json.pending"
+_HEAD_FILE = "head.json"
+_TAIL_MISSING = "Audit tail missing/truncated."
+_CLIENT_PREFIXES = {
+    "claude-code": "claude-code",
+    "claude-ai": "claude-ai",
+    "claude desktop": "claude-desktop",
+    "cursor": "cursor",
+    "vscode": "vscode",
+    "visual studio code": "vscode",
+    "codex": "codex",
+    "windsurf": "windsurf",
+    "zed": "zed",
+    "cline": "cline",
+    "continue": "continue",
+    "argus-cli": "argus-cli",
+}
 
 
 def audit_dir() -> Path:
@@ -168,18 +184,14 @@ def _utc_stamp(now: datetime) -> str:
 def _clean_client(name: str | None) -> str | None:
     if name is None:
         return None
-    cleaned = []
-    for ch in name:
-        if (ch.isprintable() and ch not in "\u034f\u115f\u1160\u17b4\u17b5\u3164\uffa0"
-                and not ("\u180b" <= ch <= "\u180f")
-                and not ("\ufe00" <= ch <= "\ufe0f" or "\U000e0100" <= ch <= "\U000e01ef")):
-            cleaned.append(ch)
-            if len(cleaned) == 64:
-                break
-    return "".join(cleaned)
+    normalized = name.strip().casefold()
+    for prefix, product in _CLIENT_PREFIXES.items():
+        if normalized.startswith(prefix):
+            return product
+    return "other:" + hashlib.sha256(name.encode("utf-8", errors="surrogatepass")).hexdigest()[:8]
 
 
-def _append_record(path: Path, record: dict) -> None:
+def _append_record(path: Path, record: dict) -> str:
     line = (json.dumps(record, ensure_ascii=True) + "\n").encode("ascii")
     fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0))
     try:
@@ -192,6 +204,49 @@ def _append_record(path: Path, record: dict) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+    return hashlib.sha256(line.rstrip(b"\n")).hexdigest()
+
+
+def _load_head(base: Path) -> dict | None:
+    try:
+        raw = (base / _HEAD_FILE).read_bytes()
+    except FileNotFoundError:
+        return None
+    head = _parse_record(raw)
+    if (head is None or not isinstance(head.get("hash"), str) or not re.fullmatch(r"[0-9a-f]{64}", head["hash"])
+            or type(head.get("count")) is not int or head["count"] < 1
+            or not isinstance(head.get("ts"), str) or not head["ts"].endswith("Z")):
+        raise ValueError("Invalid audit head checkpoint.")
+    return head
+
+
+def _entries_since_head(files: list[Path], anchor: dict | None, head: dict | None) -> int:
+    """Count legacy records or recover an append interrupted before head.json was replaced."""
+    found = head is None or (anchor is not None and anchor["prev_of_first_kept"] == head["hash"])
+    count = head["count"] if head else 0
+    for path in files:
+        with path.open("rb") as f:
+            for raw in f:
+                line = raw.strip()
+                if found:
+                    count += _parse_record(line) is not None
+                elif hashlib.sha256(line).hexdigest() == head["hash"]:
+                    found = True
+    if not found:
+        raise ValueError(_TAIL_MISSING)
+    return count
+
+
+def _write_head(base: Path, head: dict) -> None:
+    # A local attacker can rewrite both the log and this checkpoint. It
+    # detects accidental loss and simple deletion of the audit tail.
+    path = base / _HEAD_FILE
+    temp = path.with_suffix(".json.tmp")
+    with temp.open("wb") as f:
+        f.write(json.dumps(head, ensure_ascii=True).encode("ascii") + b"\n")
+        f.flush()
+        os.fsync(f.fileno())
+    temp.replace(path)
 
 
 def log_decision(
@@ -225,6 +280,8 @@ def log_decision(
             year_delta, next_month = divmod(month, 12)
             target_file = base / f"audit-{year + year_delta:04d}-{next_month + 1:02d}.jsonl"
         prev, recovered = _find_prev_hash(files, anchor)
+        head = _load_head(base)
+        count = head["count"] if head and head["hash"] == prev else _entries_since_head(files, anchor, head)
         record = {
             "ts": _utc_stamp(now_utc),
             "profile": profile,
@@ -242,7 +299,8 @@ def log_decision(
         }
         if recovered:
             record["recovered"] = True
-        _append_record(target_file, record)
+        line_hash = _append_record(target_file, record)
+        _write_head(base, {"hash": line_hash, "count": count + 1, "ts": record["ts"]})
 
     return record
 
@@ -331,6 +389,9 @@ def _verify_locked(base: Path) -> tuple[bool, str]:
 
     if invalid_at:
         return False, "\n".join([f"Chain broken at {invalid_at} (invalid JSON or UTF-8).", *notices])
+    head = _load_head(base)
+    if head is not None and head["hash"] != expected_prev:
+        return False, "\n".join([_TAIL_MISSING, *notices])
     if not files:
         summary = "No audit logs found."
     elif not total_entries:

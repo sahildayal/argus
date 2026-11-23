@@ -90,7 +90,7 @@ def _layout(desk: Desktop, area: Rect, s: Settings) -> tuple:
     that matter). Compared in addition to the mask itself (see `_grab_redacted`)."""
     windows = tuple(
         (w.hwnd, w.rect, w.pid, w.app_pid, w.process.lower(), w.owner, _owners(w, desk, s), w.cls, w.minimized,
-         w.maximized, w.see_through, w.alpha, w.layered, w.colorkey, w.rect_exact, w.attributed, w.is_app,
+         w.maximized, w.see_through, w.alpha, w.layered, w.colorkey, w.rect_exact, w.region, w.attributed, w.is_app,
          shown(w, s), sensitive_reason(w, s) is not None)
         for w in desk.layers
         if w.minimized or w.rect.intersect(area)

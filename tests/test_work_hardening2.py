@@ -60,6 +60,40 @@ def test_mask_matches_what_redaction_paints():
         assert (mask.getpixel(xy) == 255) == (img.getpixel(xy) != WHITE)
 
 
+@pytest.mark.parametrize(("region", "visible"), [
+    ((2, Rect(0, 0, 400, 300), True), True),
+    ((2, Rect(20, 20, 300, 200), False), False),
+    ((3, Rect(0, 0, 400, 300), False), False),
+])
+def test_work_mask_reveals_only_windows_with_full_rectangular_regions(region, visible):
+    editor = code(0, region=region)
+    protected = epic(1, Rect(0, 0, 1000, 800))
+    mask, _, _ = privacy.work_mask(MONS[0].rect, desk(MONS, [editor, protected]), W)
+    assert (mask.getpixel((250, 250)) == 0) is visible
+
+
+def test_region_changes_trigger_a_capture_retry_even_if_masks_are_equal(grabs):
+    box = Rect(0, 0, 400, 300)
+    later = desk(MONS, [code(0, region=(2, box, True)), wallpaper(1)])
+    first = desk(MONS, [code(0), wallpaper(1)], refresh=lambda: later)
+    assert privacy.work_mask(MONS[0].rect, first, W)[0].tobytes() == privacy.work_mask(MONS[0].rect, later, W)[0].tobytes()
+    capture.capture_monitor(first, MONS[0], W)
+    assert len(grabs) == 2
+
+
+@pytest.mark.parametrize(("kind", "width", "full"), [(0, 400, None), (2, 400, True), (2, 300, False), (3, 400, False)])
+def test_win32_reads_window_region_in_window_coordinates(monkeypatch, kind, width, full):
+    def get_bounds(_hwnd, output):
+        output._obj.right = width
+        output._obj.bottom = 300
+        return kind
+
+    monkeypatch.setattr(win32, "GetWindowRgnBox", get_bounds)
+    monkeypatch.setattr(win32, "window_rect", lambda _: Rect(100, 100, 400, 300))
+    info = win32.window_region(1, Rect(105, 105, 390, 290))
+    assert info == (None if kind == 0 else (kind, Rect(0, 0, width, 300), full))
+
+
 # ------------------------------------------- 2. layered windows, popups
 
 
@@ -346,12 +380,67 @@ def test_file_errors_are_unchanged_in_personal(home):
 
 
 def test_compare_doesnt_echo_a_path_in_work(work_session, home):
-    path = str(home / NAME)
+    path = home / "captures" / NAME
+    path.parent.mkdir(exist_ok=True)
     shot = _shot(policy=config.settings().policy)
     shot.target = {}
     from argus.store import write_png
 
-    write_png(shot.image, home / NAME, {"profile": "work", "policy": config.settings().policy, "label": "x"})
+    write_png(shot.image, path, {"profile": "work", "policy": config.settings().policy, "label": "x"})
     with pytest.raises(ArgusError) as err:
-        work_session.compare(capture_a=path)
+        work_session.compare(capture_a=str(path))
     assert "Doe" not in str(err.value)
+
+
+def test_work_replay_refuses_outside_unc_and_redirected_paths_before_open(work_session, home, monkeypatch):
+    from argus import store
+
+    outside = home / "captures-other" / NAME
+    redirected = home / "captures" / NAME
+    seen = []
+    realpath = store.os.path.realpath
+
+    def resolve(path, *args, **kwargs):
+        if str(path).casefold() == str(redirected).casefold():
+            seen.append(path)
+            return str(outside)
+        assert str(path) != str(outside) and not str(path).startswith(r"\\server")
+        return realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(store.os.path, "realpath", resolve)
+    monkeypatch.setattr(store.Image, "open", lambda *_: pytest.fail("opened a refused replay path"))
+    for ref in (str(outside), r"\\server\share\private.png", str(redirected)):
+        with pytest.raises(ArgusError, match="local captures, marks or baselines"):
+            work_session.zoom([0, 0, 10, 10], capture_id=ref)
+    assert len(seen) == 1
+
+
+def test_work_replay_refuses_network_drive_before_resolution(work_session, home, monkeypatch):
+    from argus import store
+
+    path = home / "baselines" / NAME
+    monkeypatch.setattr(win32, "GetDriveTypeW", lambda _: 4)  # DRIVE_REMOTE
+    with monkeypatch.context() as patch:
+        patch.setattr(store.os.path, "realpath", lambda *_: pytest.fail("resolved a mapped drive"))
+        with pytest.raises(ArgusError, match="local captures, marks or baselines"):
+            work_session.capture_ref(str(path))
+
+
+def test_work_replay_refuses_unc_junction_before_following_it(work_session, home, monkeypatch):
+    from argus import store
+
+    junction = home / "captures" / "network-link"
+    readlink = store.os.readlink
+    junction.parent.mkdir()
+
+    def read_local(path):
+        if str(path) == str(junction):
+            return r"\\?\UNC\server\share"
+        assert not str(path).startswith("\\\\")
+        return readlink(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store.os, "readlink", read_local)
+        patch.setattr(store.os.path, "realpath", lambda *_: pytest.fail("followed a network junction"))
+        with pytest.raises(ArgusError, match="local captures, marks or baselines"):
+            work_session.capture_ref(str(junction / NAME))

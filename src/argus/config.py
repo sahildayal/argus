@@ -10,7 +10,7 @@ import os
 import re
 import threading
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
 
@@ -123,7 +123,7 @@ allow_clipboard_files = false
 
 # Bump whenever privacy.py's masking changes (what gets revealed or hidden), so
 # captures sealed under the old masker stop replaying in the work profile.
-REDACTION_VERSION = 2
+REDACTION_VERSION = 3
 
 
 def home() -> Path:
@@ -146,21 +146,31 @@ def profile_state_path() -> Path:
 def read_profile_state() -> str | None:
     """"work", "personal", or None when there's no marker (first run). A marker
     that exists but can't be read or says anything else counts as work."""
-    path = profile_state_path()
+    state, _ = _read_profile_state(profile_state_path())
+    return state
+
+
+def _read_profile_state(path: Path) -> tuple[str | None, str | None]:
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return None
-    except (OSError, UnicodeDecodeError):
-        return "work"
-    return "personal" if text.strip().lower() == "personal" else "work"
+        return None, None
+    except (OSError, UnicodeDecodeError) as exc:
+        return "work", f"profile.state can't be read ({type(exc).__name__})"
+    return ("personal" if text.strip().lower() == "personal" else "work"), None
 
 
 def write_profile_state(name: str) -> None:
     path = profile_state_path()
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(name + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(name + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def tray_mutex_name() -> str:
@@ -458,6 +468,7 @@ PROFILES = ("personal", "work")
 
 _lock = threading.Lock()
 _cache: tuple[tuple, Settings] | None = None
+_marker_failures: set[Path] = set()
 
 
 def file_revision(path: Path) -> tuple[int, int, int]:
@@ -465,6 +476,8 @@ def file_revision(path: Path) -> tuple[int, int, int]:
         stat = path.stat()
     except FileNotFoundError:
         return (0, 0, 0)
+    except OSError:
+        return (-1, -1, -1)
     return stat.st_ino, stat.st_mtime_ns, stat.st_size
 
 
@@ -474,26 +487,45 @@ def settings() -> Settings:
     path = config_path()
     marker = profile_state_path()
     with _lock:
-        if not path.exists():
-            path.write_text(DEFAULT_CONFIG, encoding="utf-8")
-        revision = (path, *file_revision(path), *file_revision(marker))
-        if _cache is None or _cache[0] != revision:
-            state = read_profile_state()
-            sticky = state == "work"
+        for _ in range(3):
+            revision = (path, file_revision(path), file_revision(marker))
+            if revision[1] == (0, 0, 0):
+                try:
+                    with path.open("x", encoding="utf-8") as f:
+                        f.write(DEFAULT_CONFIG)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    return Settings.locked(f"config.toml can't be created ({type(exc).__name__})")
+                continue
+            if _cache is not None and _cache[0] == revision and marker not in _marker_failures:
+                return _cache[1]
+            state, marker_problem = _read_profile_state(marker)
+            sticky = state == "work" or marker in _marker_failures
             try:
                 parsed = Settings.from_toml(path.read_text(encoding="utf-8"), sticky_work=sticky)
             except (OSError, UnicodeDecodeError) as exc:
                 parsed = Settings.locked(f"config.toml can't be read ({type(exc).__name__})", sticky)
-            if parsed.configured == "work" and not sticky:
-                # Work chosen by editing the file sticks too: a later edit that
-                # drops or mangles [profile] mustn't quietly turn it off.
+            if revision != (path, file_revision(path), file_revision(marker)):
+                continue
+            if marker_problem or revision[2] == (-1, -1, -1):
+                return Settings.locked(marker_problem or "profile.state can't be inspected")
+            if state != "work" and (parsed.configured == "work" or marker in _marker_failures):
+                # Re-read both files after our write, too. Another process may
+                # have changed config.toml while we recorded the work choice.
                 try:
                     write_profile_state("work")
-                except OSError:
-                    pass
-                revision = (path, *file_revision(path), *file_revision(marker))
+                except OSError as exc:
+                    problem = f"Couldn't save the work profile to profile.state ({type(exc).__name__})"
+                    _marker_failures.add(marker)
+                    _cache = None
+                    return replace(parsed, problems=(*parsed.problems, problem))
+                continue
+            if state == "work":
+                _marker_failures.discard(marker)
             _cache = (revision, parsed)
-        return _cache[1]
+            return parsed
+        return Settings.locked("config.toml or profile.state kept changing while Argus read them")
 
 
 def set_profile(name: str) -> Settings:
@@ -509,16 +541,35 @@ def set_profile(name: str) -> Settings:
     name = name.strip().lower()
     if name not in PROFILES:
         raise ValueError(f"unknown profile {name!r}; use one of: {', '.join(PROFILES)}")
+    marker = profile_state_path()
+    marker_error = None
     if name == "work":
         with _lock:
-            write_profile_state("work")
             _cache = None
+            try:
+                write_profile_state("work")
+            except OSError as exc:
+                _marker_failures.add(marker)
+                marker_error = exc
+            else:
+                _marker_failures.discard(marker)
     settings()  # writes the default file if there is none
+    if marker_error is not None:
+        # Still try to record the work choice in config.toml for other processes.
+        try:
+            _set_profile_line(name)
+        except (OSError, ValueError):
+            raise ValueError("Couldn't save the work profile to profile.state or config.toml") from marker_error
+        raise ValueError(f"Couldn't save the work profile to profile.state ({type(marker_error).__name__})") from marker_error
     _set_profile_line(name)
     if name == "personal":
         with _lock:
-            write_profile_state("personal")
             _cache = None
+            try:
+                write_profile_state("personal")
+            except OSError as exc:
+                raise ValueError(f"Couldn't save the personal profile to profile.state ({type(exc).__name__})") from exc
+            _marker_failures.discard(marker)
     return settings()
 
 

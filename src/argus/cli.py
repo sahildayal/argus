@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import sys
 from pathlib import Path
 
 from . import __version__, win32  # noqa: F401  (win32 first: DPI awareness)
-from .desktop import ArgusError
+from . import gate
+from .desktop import ArgusError, Paused, PolicyChanged
 
 
 def _region(text: str) -> list[float]:
@@ -144,7 +146,7 @@ def _client_keys() -> list[str]:
     return [c.key for c in CLIENTS]
 
 
-def _emit(result, args, out: Path | None = None) -> None:
+def _result_text(result, args) -> tuple[str, ...]:
     from .service import caption
 
     caps = result.captures
@@ -160,11 +162,16 @@ def _emit(result, args, out: Path | None = None) -> None:
                 for c in caps
             ],
         }
-        print(json.dumps(payload, indent=2))
-    else:
-        for part in parts:
-            print(part if isinstance(part, str) else caption(part))
+        return (json.dumps(payload, indent=2),)
+    return tuple(part if isinstance(part, str) else caption(part) for part in parts)
+
+
+def _emit(result, args, out: Path | None = None) -> None:
+    for part in _result_text(result, args):
+        print(part)
+        if not getattr(args, "json", False):
             print()
+    caps = result.captures
     if out is not None and caps:
         if len(caps) == 1 and out.suffix:
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -186,6 +193,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return _run(args) or 0
+    except gate.GateStopped as exc:
+        print(f"argus: {exc}", file=sys.stderr)
+        return 2
     except ArgusError as exc:
         from .errors import scrub
 
@@ -228,25 +238,73 @@ def _run(args) -> int | None:
     if cmd == "allow":
         return _allow_cmd(args)
 
-    from .service import Session
+    from .store import defer_captures
 
-    session = Session(track=False)
+    start = gate.policy()
+    tool = {"shot": "screenshot", "ocr": "read_text", "find": "find_text", "snip": "latest_snip",
+            "list": "list_screens", "wait": "wait_for"}.get(cmd, cmd)
+    if cmd == "baseline":
+        tool = {"save": "save_baseline", "compare": "compare"}.get(args.action, "baseline")
+    try:
+        with defer_captures():
+            return _capture_cmd(args, start, tool)
+    except ArgusError as exc:
+        from .errors import scrub
+
+        if isinstance(exc, PolicyChanged) or gate.policy_changed(start):
+            gate.require(gate.request(tool, start=start, interrupted=True, client="argus-cli"))
+        if start.profile == "work" and not isinstance(exc, Paused):
+            gate.require(gate.request(
+                tool, text=(scrub(str(exc)),), start=start, allow_trust=False, client="argus-cli",
+            ))
+        raise
+
+
+def _capture_cmd(args, start: gate.Policy, tool: str) -> int | None:
+    from .service import Result, Session, WatchApproval
+    from .store import publish_captures
+    from .text import display_arg
+
+    cmd = args.cmd
+    work = start.profile == "work"
+    session = Session(track=False, defer_marks=True)
+
+    def review(text, shots=(), *, result=None, required=True):
+        if work or gate.policy_changed(start):
+            windows, _ = result.approval_scope() if result is not None else (None, False)
+            previews = []
+            for shot in shots:
+                # CLI paths and --out expose the full-resolution PNG.
+                with io.BytesIO() as buffer:
+                    shot.image.save(buffer, format="PNG")
+                    previews.append(buffer.getvalue())
+            gate.require(gate.request(
+                tool, tuple(previews), text, windows=windows, start=start, required=required,
+                allow_trust=False, client="argus-cli",
+            ))
+        if result is not None:
+            publish_captures(result.captures if work else None)
+
+    def emit(result, out=None):
+        review(_result_text(result, args), (cap.shot for cap in result.captures), result=result)
+        _emit(result, args, out)
+
     if cmd == "look":
-        _emit(session.look("monitor" if args.monitor_scope else "window", args.grid or None, args.fresh), args, args.out)
+        emit(session.look("monitor" if args.monitor_scope else "window", args.grid or None, args.fresh), args.out)
     elif cmd == "shot":
-        _emit(session.screenshot(args.monitor, args.window, args.region, args.grid or None), args, args.out)
+        emit(session.screenshot(args.monitor, args.window, args.region, args.grid or None), args.out)
     elif cmd == "list":
         result = session.list_screens()
-        if args.json:
-            print(json.dumps(_list_json(session), indent=2))
-        else:
-            print(result.parts[0])
+        # Paused work inventory contains only a status message.
+        payload = json.dumps(_list_json(session), indent=2) if args.json and (result.screen_derived or not work) else result.parts[0]
+        review((payload,), result=result, required=result.screen_derived)
+        print(payload)
     elif cmd == "zoom":
         if not args.box:
             raise ArgusError("--box x1,y1,x2,y2 is required")
-        _emit(session.zoom(args.box, None, args.file), args, args.out)
+        emit(session.zoom(args.box, None, args.file), args.out)
     elif cmd == "snip":
-        _emit(session.latest_snip(args.count), args)
+        emit(session.latest_snip(args.count))
     elif cmd == "mark":
         from . import privacy
         from .capture import capture_monitor, capture_window
@@ -264,35 +322,48 @@ def _run(args) -> int | None:
                 window_shot = capture_window(desk, win, s)
             except ArgusError as exc:
                 problem = str(exc)
-        mark = save_mark(window_shot, capture_monitor(desk, desk.cursor_monitor, s), extra={"problem": problem} if problem else None)
+        monitor_shot = capture_monitor(desk, desk.cursor_monitor, s)
         what = privacy.display_name(win, s) if window_shot is not None and win else desk.cursor_monitor.title
-        print(f"Marked {what} ({mark.id})" + (f" - window not captured: {problem}" if problem else ""))
+        note = f" - window not captured: {problem}" if problem else ""
+        shots = [shot for shot in (window_shot, monitor_shot) if shot is not None]
+        review((f"Marked {what}{note}",), shots, result=Result(evidence=shots))
+        mark = save_mark(window_shot, monitor_shot, extra={"problem": problem} if problem else None)
+        print(f"Marked {what} ({mark.id}){note}")
     elif cmd == "ocr":
         if args.file:
             result = asyncio.run(session.read_text(capture_id=args.file, positions=not args.plain))
         else:
             result = asyncio.run(session.read_text(args.monitor, args.window, args.region, positions=not args.plain))
-        print("\n\n".join(p for p in result.parts if isinstance(p, str)))
+        payload = "\n\n".join(p for p in result.parts if isinstance(p, str))
+        review((payload,), result=result)
+        print(payload)
     elif cmd == "find":
-        _emit(asyncio.run(session.find_text(args.text, args.monitor, args.window, args.region)), args)
+        emit(asyncio.run(session.find_text(args.text, args.monitor, args.window, args.region)))
     elif cmd == "baseline":
-        return _baseline(session, args)
+        return _baseline(session, args, work=work, review=review, emit=emit)
     elif cmd == "wait":
-        result = asyncio.run(session.wait_for(args.until, args.text, args.monitor, args.window, args.region, args.timeout))
-        _emit(result, args)
+        query = display_arg(args.text) if args.text and args.until in ("text", "text_gone") else ""
+        watch = WatchApproval(start, query, client="argus-cli", allow_trust=False)
+        result = asyncio.run(session.wait_for(
+            args.until, args.text, args.monitor, args.window, args.region, args.timeout,
+            approve_frame=watch.review_frame if work else None,
+        ))
+        emit(result)
         first = next((p for p in result.parts if isinstance(p, str)), "")
         return 0 if first.startswith("Done") else 1
     return 0
 
 
-def _baseline(session, args) -> int:
+def _baseline(session, args, *, work, review, emit) -> int:
     from . import testing
 
     if args.action == "save":
-        print(session.save_baseline(args.name, args.monitor, args.window, args.region).parts[0])
+        result = session.save_baseline(args.name, args.monitor, args.window, args.region, local_receipt=work)
+        review(tuple(result.parts), result=result, required=not work)
+        print(result.parts[0])
     elif args.action == "compare":
         result = session.compare(baseline=args.name, show="both" if args.both else "after")
-        _emit(result, args)
+        emit(result)
         first = next((p for p in result.parts if isinstance(p, str)), "")
         return 0 if first.startswith("No visible change") else 1
     elif args.action == "list":
@@ -304,12 +375,15 @@ def _baseline(session, args) -> int:
         # Work profile: baselines from the personal profile or an older policy
         # are only counted - their names and labels may describe hidden things.
         rows, hidden = testing.baselines(s if s.work else None)
+        lines = []
         if not rows and not hidden:
-            print("No baselines yet.")
+            lines.append("No baselines yet.")
         for name, path, taken, label in rows:
-            print(f"{name:24} {time.strftime('%Y-%m-%d %H:%M', time.localtime(taken))}  {label}  ({path})")
+            lines.append(f"{name:24} {time.strftime('%Y-%m-%d %H:%M', time.localtime(taken))}  {label}  ({path})")
         if hidden:
-            print(f"{hidden} hidden baseline(s): not saved under the current work profile.")
+            lines.append(f"{hidden} hidden baseline(s): not saved under the current work profile.")
+        review(tuple(lines), required=bool(rows))
+        print("\n".join(lines))
     elif args.action == "delete":
         print("Deleted." if testing.delete_baseline(args.name) else f"No baseline named {args.name!r}.")
     return 0

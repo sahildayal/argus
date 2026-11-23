@@ -136,9 +136,8 @@ def test_exception_logging_stays_private_when_gate_enabled_mid_call(stub, caplog
 
     monkeypatch.setattr(stub, "screenshot", fail)
     result = call("screenshot")
-    (record,) = [r for r in caplog.records if r.name == "argus"]
-    assert "error id" in result.content[0].text
-    assert not record.exc_info and "private error text" not in caplog.text
+    assert result.content[0].text == gate.SETTINGS_CHANGED
+    assert "private error text" not in caplog.text
 
 
 @pytest.mark.parametrize(("raw", "clean"), [
@@ -208,7 +207,7 @@ def capture_session(monkeypatch):
     return s, shot
 
 
-def test_approved_capture_allows_zoom_and_ocr(capture_session, monkeypatch):
+def test_approved_capture_still_prompts_for_zoom_and_ocr(capture_session, monkeypatch):
     seen = []
 
     def approve(preview):
@@ -227,7 +226,63 @@ def test_approved_capture_allows_zoom_and_ocr(capture_session, monkeypatch):
     assert not call("zoom", {"capture_id": "c1", "box": [0, 0, 10, 10]}).is_error
     assert not call("read_text", {"capture_id": "c1"}).is_error
     assert not call("find_text", {"capture_id": "c1", "text": "private"}).is_error
-    assert [p.tool for p in seen] == ["screenshot"]
+    assert [p.tool for p in seen] == ["screenshot", "zoom", "read_text", "find_text"]
+    assert all(not p.allow_trust for p in seen[1:])
+
+
+def test_zoom_prompts_to_show_full_res_pixels_after_approving_downscaled_capture(capture_session, monkeypatch):
+    session, shot = capture_session
+    shot.image = Image.new("RGB", (2800, 200), "navy")
+    seen = []
+    monkeypatch.setattr(gate, "_transport", lambda preview: seen.append(preview) or "user")
+    original = call("screenshot")
+    original_width = Image.open(io.BytesIO(base64.b64decode(original.content[-1].data))).width
+    assert original_width < shot.image.width
+    scale = session.store.get("c1").view.scale
+    zoom = call("zoom", {"capture_id": "c1", "box": [0, 0, 1300 * scale, 100 * scale]})
+    assert not zoom.is_error
+    assert session.store.get("c2").image.width >= 1300
+    assert [p.tool for p in seen] == ["screenshot", "zoom"]
+    assert seen[-1].images == (base64.b64decode(zoom.content[-1].data),)
+    assert seen[-1].text == (zoom.content[0].text,)
+
+
+@pytest.mark.parametrize("reply", ["user", "denied", "timeout", "tray_unavailable"])
+def test_capture_persists_only_after_approval(capture_session, monkeypatch, argus_home, reply):
+    session, _ = capture_session
+    captures = argus_home / "captures"
+
+    def answer(_preview):
+        assert not captures.exists()
+        assert session.store.latest() is None
+        return reply
+
+    monkeypatch.setattr(gate, "_transport", answer)
+    call("screenshot")
+    session.store.flush()
+    if reply == "user":
+        assert session.store.get("c1").path.is_file()
+    else:
+        assert session.store.latest() is None and not captures.exists()
+
+
+def test_settings_change_after_audit_drops_mcp_capture(capture_session, monkeypatch, argus_home):
+    from argus import audit, privacy
+
+    session, _ = capture_session
+    write = audit.log_decision
+
+    def log_then_pause(decision, **kwargs):
+        entry = write(decision, **kwargs)
+        if decision.approved:
+            privacy.pause()
+        return entry
+
+    monkeypatch.setattr(gate, "_transport", lambda _: "user")
+    monkeypatch.setattr(audit, "log_decision", log_then_pause)
+    result = call("screenshot")
+    assert [(part.type, part.text) for part in result.content] == [("text", gate.SETTINGS_CHANGED)]
+    assert session.store.latest() is None and not (argus_home / "captures").exists()
 
 
 def test_all_approved_image_blocks_match_the_preview(stub, monkeypatch):
@@ -300,23 +355,20 @@ def test_ocr_approval_does_not_approve_the_source_image(capture_session, monkeyp
     assert [(c.type, c.text) for c in result.content] == [("text", gate.DECLINED)]
 
 
-def test_baseline_local_receipt_and_cli_session_bypass(capture_session, monkeypatch):
-    s, _ = capture_session
-
+def test_baseline_is_an_explicit_local_save(capture_session, monkeypatch):
     def fail(_preview):
-        pytest.fail("local save and CLI must not use the approval pipe")
+        pytest.fail("the local baseline save must not use the approval pipe")
 
     monkeypatch.setattr(gate, "_transport", fail)
     result = call("save_baseline", {"name": "reference"})
     assert [(c.type, c.text) for c in result.content] == [("text", "Saved baseline 'reference'.")]
     assert service.testing.load_baseline("reference").label == "Private text"
-    assert s.screenshot().captures[0].shot.label == "Private text"
 
 
-def test_latest_snip_gates_clipboard_image(capture_session, monkeypatch):
+def test_latest_snip_gates_clipboard_image(capture_session, monkeypatch, argus_home):
     from argus.snips import Snip
 
-    _, shot = capture_session
+    session, shot = capture_session
     monkeypatch.setattr(service, "latest_snips", lambda *_a, **kw: [Snip(shot.image, "clipboard", None, shot.taken)])
     seen = []
 
@@ -329,6 +381,40 @@ def test_latest_snip_gates_clipboard_image(capture_session, monkeypatch):
     assert [(c.type, c.text) for c in result.content] == [("text", gate.DECLINED)]
     assert seen[0].images and seen[0].windows is None
     assert "image on the clipboard" in seen[0].text[0]
+    assert session.store.latest() is None and not (argus_home / "captures").exists()
+
+
+def test_cli_shot_json_and_output_file_require_work_approval(capture_session, monkeypatch, argus_home, capsys):
+    from argus import audit, cli
+
+    session, shot = capture_session
+    monkeypatch.setattr(service, "Session", lambda **kwargs: session)
+    output = argus_home / "export.png"
+    args = ["shot", "--json", "--out", str(output)]
+
+    def answer(preview):
+        assert preview.tool == "screenshot"
+        assert "Private text" in preview.text[0]
+        assert Image.open(io.BytesIO(preview.images[0])).tobytes() == shot.image.tobytes()
+        assert not output.exists() and not (argus_home / "captures").exists()
+        return reply
+
+    monkeypatch.setattr(gate, "_transport", answer)
+    reply = "denied"
+    assert cli.main(args) == 2
+    denied = capsys.readouterr()
+    assert not denied.out and gate.DECLINED in denied.err
+    assert session.store.latest() is None and not output.exists()
+
+    reply = "user"
+    assert cli.main(args) == 0
+    assert "Private text" in capsys.readouterr().out
+    assert Image.open(output).tobytes() == shot.image.tobytes()
+    session.store.flush()
+    assert session.store.latest().path.is_file()
+    assert [(row["client"], row["decision"]) for row in audit.read_entries()] == [
+        ("argus-cli", "denied"), ("argus-cli", "sent"),
+    ]
 
 
 def test_text_only_compare_is_gated(capture_session, monkeypatch):

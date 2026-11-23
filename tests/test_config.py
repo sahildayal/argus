@@ -23,6 +23,70 @@ def test_settings_reload_when_the_file_changes(argus_home):
     assert config.settings().retention_days == 2
 
 
+@pytest.mark.parametrize("changed", ["config", "marker"])
+def test_settings_retries_if_disk_changes_between_read_and_stat(argus_home, monkeypatch, changed):
+    path = config.config_path()
+    path.write_text("[capture]\nmax_side = 900\n", encoding="utf-8")
+    path_type = type(path)
+    read = path_type.read_text
+    pending = True
+
+    def read_then_change(self, *args, **kwargs):
+        nonlocal pending
+        data = read(self, *args, **kwargs)
+        if self == path and pending:
+            pending = False
+            if changed == "config":
+                path.write_text("[capture]\nmax_side = 1000\n", encoding="utf-8")
+            else:
+                config.write_profile_state("work")
+        return data
+
+    monkeypatch.setattr(path_type, "read_text", read_then_change)
+    s = config.settings()
+    assert config.settings() is s
+    if changed == "config":
+        assert s.max_side == 1000
+    else:
+        assert s.work
+
+
+def test_config_rereads_policy_after_writing_the_work_marker(monkeypatch):
+    path = config.config_path()
+    path.write_text('[profile]\nactive = "work"\n[work]\nallow_apps = ["old.exe"]\n', encoding="utf-8")
+    write = config.write_profile_state
+
+    def write_then_change(profile):
+        write(profile)
+        path.write_text('[profile]\nactive = "work"\n[work]\nallow_apps = ["next.exe"]\n', encoding="utf-8")
+
+    monkeypatch.setattr(config, "write_profile_state", write_then_change)
+    assert config.settings().allow_apps == {"next.exe"}
+    assert config.settings().allow_apps == {"next.exe"}
+
+
+@pytest.mark.parametrize("explicit_switch", [False, True])
+def test_failed_work_marker_write_surfaces_and_fails_closed(monkeypatch, explicit_switch):
+    monkeypatch.setattr(config, "_marker_failures", set())
+    config.settings()
+    path = config.config_path()
+
+    def denied(_profile):
+        raise PermissionError("marker is not writable")
+
+    monkeypatch.setattr(config, "write_profile_state", denied)
+    if explicit_switch:
+        with pytest.raises(ValueError, match="Couldn't save the work profile to profile.state"):
+            config.set_profile("work")
+        assert 'active = "work"' in path.read_text(encoding="utf-8")
+    else:
+        path.write_text('[profile]\nactive = "work"\n', encoding="utf-8")
+    s = config.settings()
+    assert s.work and any("Couldn't save the work profile to profile.state" in problem for problem in s.problems)
+    path.unlink()
+    assert config.settings().work
+
+
 def test_bad_values_are_reported_not_fatal():
     s = Settings.from_toml("this is = = not toml")
     assert s.problems and s.max_side == 2000

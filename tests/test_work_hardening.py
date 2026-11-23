@@ -388,10 +388,11 @@ def test_forged_or_edited_work_tags_are_not_trusted(argus_home, tmp_path):
     assert open_file(real).policy == ""
 
 
-def test_forged_file_cant_be_zoomed_in_work_profile(work_session, tmp_path):
+def test_forged_file_cant_be_zoomed_in_work_profile(work_session, argus_home):
     from PIL import PngImagePlugin
 
-    forged = tmp_path / "forged.png"
+    forged = argus_home / "captures" / "forged.png"
+    forged.parent.mkdir(exist_ok=True)
     info = PngImagePlugin.PngInfo()
     info.add_text("argus", '{"profile": "work"}')
     Image.new("RGB", (300, 300), "red").save(forged, pnginfo=info)
@@ -454,13 +455,15 @@ def test_wait_loop_lets_policy_changes_through():
 # --------------------------------------------- 6. baselines, metadata, errors
 
 
-def test_baselines_from_outside_the_work_policy_are_counted_not_named(argus_home, capsys):
+def test_baselines_from_outside_the_work_policy_are_counted_not_named(argus_home, capsys, monkeypatch):
+    from argus import gate
     from argus.cli import main
 
     argus_home.mkdir(parents=True, exist_ok=True)
     testing.save_baseline("doe-john-chart", _shot(profile="personal", policy=P.policy))
     write_config(WORK_TOML)
     testing.save_baseline("dashboard", _shot())
+    monkeypatch.setattr(gate, "_transport", lambda _: "user")
     assert main(["baseline", "list"]) == 0
     out = capsys.readouterr().out
     assert "doe-john" not in out and "dashboard" in out and "1 hidden baseline" in out

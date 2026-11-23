@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 import anyio
 
-from . import ocr, privacy, testing
+from . import gate, ocr, privacy, testing
 from .capture import Shot, capture, capture_monitor, capture_window, recapture
 from .config import Settings, config_path, home, pretty_hotkey, settings
 from .desktop import ArgusError, Desktop, Host, PolicyChanged, Window, detect_host, snapshot
@@ -46,6 +46,13 @@ class Result:
     @property
     def captures(self) -> list[Capture]:
         return [p for p in self.parts if isinstance(p, Capture)]
+
+    def approval_scope(self) -> tuple[privacy.WindowSet | None, bool]:
+        shots = [*(cap.shot for cap in self.sources + self.captures), *self.evidence]
+        windows = self.window_scope
+        if shots and all(shot.share_windows is not None for shot in shots):
+            windows = frozenset().union(*(shot.share_windows for shot in shots))
+        return windows, self.allow_trust and all(shot.allow_trust for shot in shots)
 
 
 def caption(cap: Capture) -> str:
@@ -117,6 +124,34 @@ def _same_policy(s: Settings) -> None:
         )
 
 
+class WatchApproval:
+    def __init__(self, start: gate.Policy, query: str, *, client: str | None = None, allow_trust: bool = True):
+        self.start = start
+        self.query = query
+        self.client = client
+        self.allow_trust = allow_trust
+        self.previous: Shot | None = None
+        self.changed = False
+
+    async def review_frame(self, shot: Shot) -> None:
+        await anyio.to_thread.run_sync(self._review, shot)
+
+    def _review(self, shot: Shot) -> None:
+        if gate.policy_changed(self.start):
+            gate.require(gate.request("wait_for", start=self.start, interrupted=True, client=self.client))
+        previous = self.previous
+        if previous is not None and (shot.share_windows is None or previous.share_windows != shot.share_windows):
+            # Review the previous set before a new frame can contribute to the result.
+            view, _ = render(previous.image, max_side=settings().max_side)
+            gate.require(gate.request(
+                "wait_for", (view.data,), windows=previous.share_windows, start=self.start,
+                watching=True, allow_trust=self.allow_trust and not self.changed and previous.allow_trust,
+                query=self.query, client=self.client,
+            ))
+            self.changed = True
+        self.previous = shot
+
+
 class Session:
     def __init__(self, host: Host | None = None, track: bool = True, *, defer_marks: bool = False):
         self.host = host or detect_host()
@@ -170,7 +205,7 @@ class Session:
     def capture_ref(self, ref: str | None) -> Capture:
         s = settings()
         if ref and _looks_like_path(ref):
-            shot = open_file(ref.strip().strip('"'))
+            shot = open_file(ref.strip().strip('"'), work=s.work)
             _require_profile(shot, s)
             return self.register(shot, save=False)
         cap = self.store.get(ref)
@@ -312,7 +347,7 @@ class Session:
             share_windows=cap.shot.share_windows,
             policy=cap.shot.policy,
         )
-        return Result(sources=[cap]).add(self.register(shot, grid=grid, upscale_to=1200))
+        return Result(sources=[cap], allow_trust=False).add(self.register(shot, grid=grid, upscale_to=1200))
 
     # -- list --------------------------------------------------------------------------
 
@@ -464,7 +499,7 @@ class Session:
     async def read_text(self, monitor=None, window=None, region=None, capture_id=None, positions: bool = True) -> Result:
         self.guard()
         caps = await self._ocr_targets(monitor, window, region, capture_id)
-        result = Result(sources=caps)
+        result = Result(sources=caps, allow_trust=False)
         for cap in caps:
             lines = await ocr.read(cap.image)
             head = f"[{cap.id}] Text in {cap.shot.label}"
@@ -480,7 +515,7 @@ class Session:
         found: list[tuple[Capture, ocr.Match]] = []
         first_lines: list[ocr.Line] = []
         caps = await self._ocr_targets(monitor, window, region, capture_id)
-        result = Result(sources=caps, query=display_arg(text))
+        result = Result(sources=caps, query=display_arg(text), allow_trust=False)
         for cap in caps:
             lines = await ocr.read(cap.image)
             first_lines = first_lines or lines

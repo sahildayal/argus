@@ -22,12 +22,11 @@ from pydantic import Field
 
 from . import __version__, win32  # noqa: F401  (win32 first: DPI awareness)
 from . import gate
-from .capture import Shot
 from .config import home, pretty_hotkey, settings
-from .desktop import ArgusError, Paused
+from .desktop import ArgusError, Paused, PolicyChanged
 from .errors import describe_unexpected, scrub
-from .imaging import render
-from .service import Result, Session, caption
+from .service import Result, Session, WatchApproval, caption
+from .store import defer_captures, publish_captures
 from .text import display_arg
 
 log = logging.getLogger("argus")
@@ -58,12 +57,11 @@ def _content(result: Result) -> list[str | Image]:
 def _disclose(
     tool: str, result: Result, *, separator: str | None = None, allow_trust: bool = True,
 ) -> str | list[str | Image]:
-    """MCP disclosure table (CLI emits Result directly).
+    """Review the exact MCP output before returning it.
 
     Always check: look, screenshot, list_screens, latest_snip, latest_mark,
-    read_text, find_text, zoom, compare, and wait_for. Only zoom/OCR from a
-    shared in-memory source inherits approval. A wait reviews each consecutive
-    window set, with the exact output blocks shown for the final set.
+    read_text, find_text, zoom, compare, and wait_for. A wait reviews each
+    consecutive window set, with the exact output blocks shown for the final set.
     Exempt: save_baseline's local receipt, and list_screens' paused status.
     """
     start = _policy.get()
@@ -76,25 +74,16 @@ def _disclose(
         out = separator.join(p for p in result.parts if isinstance(p, str))
         images, text = (), (out,)
 
-    shots = [*(cap.shot for cap in result.sources + caps), *result.evidence]
-    windows = result.window_scope
-    if shots and all(shot.share_windows is not None for shot in shots):
-        windows = frozenset().union(*(shot.share_windows for shot in shots))
-    derived = tool in ("zoom", "read_text", "find_text") and bool(result.sources) and all(
-        cap.shared_at == start.stamp for cap in result.sources
-    )
-    can_trust = allow_trust and result.allow_trust and tool != "list_screens" and all(shot.allow_trust for shot in shots)
+    windows, can_trust = result.approval_scope()
     gate.require(gate.request(
         tool, images, text, windows=windows, start=start, required=result.screen_derived,
-        previously_approved=derived, query=result.query, allow_trust=can_trust,
+        query=result.query, allow_trust=allow_trust and can_trust and tool != "list_screens",
         client=_client_name.get(),
     ))
+    publish_captures(caps if start.enabled else None)
     if result.query:
         request_text = f"{gate.QUERY_LABEL}: {result.query}"
         out = [request_text, *out] if isinstance(out, list) else f"{request_text}\n\n{out}"
-    if start.enabled and separator is None:
-        for cap in caps:
-            cap.shared_at = start.stamp
     if result.mark_id:
         session().used_marks.add(result.mark_id)
     return out
@@ -105,6 +94,8 @@ def _errors(fn):
     into a short report. Full tracebacks are logged only with approval off."""
 
     def explain(exc: Exception, start: gate.Policy | None):
+        if start is not None and (isinstance(exc, PolicyChanged) or gate.policy_changed(start)):
+            gate.require(gate.request(fn.__name__, start=start, interrupted=True, client=_client_name.get()))
         if isinstance(exc, ToolError):
             return ToolError(scrub(str(exc)))
         if isinstance(exc, ArgusError):
@@ -134,6 +125,8 @@ def _errors(fn):
             raise ToolError(gate.UNAVAILABLE) from None
         if str(exc) == gate.AUDIT_FAILED:
             raise ToolError(gate.AUDIT_FAILED) from None
+        if str(exc) == gate.SETTINGS_CHANGED:
+            return gate.SETTINGS_CHANGED
         return gate.DECLINED
 
     if inspect.iscoroutinefunction(fn):
@@ -144,7 +137,8 @@ def _errors(fn):
             try:
                 start = gate.policy()
                 token = _policy.set(start)
-                return await fn(*args, **kwargs)
+                with defer_captures():
+                    return await fn(*args, **kwargs)
             except gate.GateStopped as exc:
                 return stopped(exc)
             except Exception as exc:
@@ -165,7 +159,8 @@ def _errors(fn):
         try:
             start = gate.policy()
             token = _policy.set(start)
-            return fn(*args, **kwargs)
+            with defer_captures():
+                return fn(*args, **kwargs)
         except gate.GateStopped as exc:
             return stopped(exc)
         except Exception as exc:
@@ -365,34 +360,14 @@ async def wait_for(
             pass
 
     start = _policy.get()
-    previous: Shot | None = None
-    changed = False
     query = display_arg(text) if text and until in ("text", "text_gone") else ""
-
-    def review_segment(shot: Shot) -> None:
-        nonlocal previous, changed
-        if gate.policy() != start:
-            raise gate.GateStopped(gate.DECLINED)
-        if previous is not None and (shot.share_windows is None or previous.share_windows != shot.share_windows):
-            # Hold all MCP output until the end. On a transition review the
-            # previous set before the new frame can contribute to the result.
-            view, _ = render(previous.image, max_side=settings().max_side)
-            gate.require(gate.request(
-                "wait_for", (view.data,), windows=previous.share_windows, start=start,
-                watching=True, allow_trust=not changed and previous.allow_trust, query=query,
-                client=_client_name.get(),
-            ))
-            changed = True
-        previous = shot
-
-    async def review_frame(shot: Shot) -> None:
-        await anyio.to_thread.run_sync(review_segment, shot)
+    watch = WatchApproval(start, query, client=_client_name.get())
 
     result = await session().wait_for(
         until, text, monitor, window, region, timeout, None if start.enabled else progress,
-        approve_frame=review_frame if start.enabled else None,
+        approve_frame=watch.review_frame if start.enabled else None,
     )
-    return await anyio.to_thread.run_sync(lambda: _disclose("wait_for", result, allow_trust=not changed))
+    return await anyio.to_thread.run_sync(lambda: _disclose("wait_for", result, allow_trust=not watch.changed))
 
 
 def _setup_logging() -> None:

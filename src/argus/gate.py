@@ -1,23 +1,26 @@
-"""The MCP disclosure decision boundary. The tray owns all cross-call trust."""
+"""The disclosure decision boundary. The tray owns all cross-call trust."""
 
 from __future__ import annotations
 
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from . import privacy
-from .config import config_path, file_revision, settings
+from .config import config_path, file_revision, profile_state_path, read_profile_state, settings
 from .privacy import WindowSet
 
-Stamp = tuple[tuple[int, int, int], tuple[int, int, int]]
-Reason = Literal["user", "trusted", "timeout", "tray_unavailable", "denied", "not_required", "audit_failed"]
+Revision = tuple[int, int, int]
+Stamp = tuple[Revision, Revision, Revision, str, str]
+Reason = Literal["user", "trusted", "timeout", "tray_unavailable", "denied", "not_required", "audit_failed",
+                 "settings_changed"]
 DECLINED = "The user declined to share this capture."
 UNAVAILABLE = "Approval is unavailable. Ask the user to start or check the Argus tray (argus-tray), then try again."
 QUERY_LABEL = "Requested by the AI"
 AUDIT_FAILED = "The audit log could not be written."
+SETTINGS_CHANGED = "Argus settings changed during the call; try again."
 
 
 @dataclass(frozen=True)
@@ -32,16 +35,18 @@ class Policy:
 
 
 def policy() -> Policy:
-    def stamp() -> Stamp:
-        return file_revision(config_path()), file_revision(privacy.pause_revision_file())
+    def revisions() -> tuple[Revision, Revision, Revision]:
+        return (file_revision(config_path()), file_revision(privacy.pause_revision_file()),
+                file_revision(profile_state_path()))
 
     settings()  # first use can create the config file
-    before = stamp()
+    before = revisions()
     s = settings()
+    marker = read_profile_state() or ""
     paused = privacy.pause_state().paused
-    if before != stamp():
-        raise GateStopped(UNAVAILABLE)
-    return Policy(before, s.requires_approval, paused, s.gate_timeout_seconds, s.gate_trust_minutes,
+    if before != revisions():
+        raise GateStopped(SETTINGS_CHANGED)
+    return Policy((*before, marker, s.policy), s.requires_approval, paused, s.gate_timeout_seconds, s.gate_trust_minutes,
                   s.profile, s.requires_audit)
 
 
@@ -79,6 +84,8 @@ def require(decision: Decision) -> None:
             raise GateStopped(UNAVAILABLE)
         if decision.reason == "audit_failed":
             raise GateStopped(AUDIT_FAILED)
+        if decision.reason == "settings_changed":
+            raise GateStopped(SETTINGS_CHANGED)
         raise GateStopped(DECLINED)
 
 
@@ -86,6 +93,13 @@ def _transport(preview: Preview) -> str:
     from .gate_pipe import exchange
 
     return exchange(preview)
+
+
+def policy_changed(start: Policy) -> bool:
+    try:
+        return policy() != start
+    except (GateStopped, OSError, ValueError):
+        return True
 
 
 def request(
@@ -96,40 +110,47 @@ def request(
     windows: WindowSet | None = None,
     start: Policy | None = None,
     required: bool = True,
-    previously_approved: bool = False,
     allow_trust: bool = True,
     watching: bool = False,
     query: str = "",
     transport: Callable[[Preview], str] | None = None,
     client: str | None = None,
+    interrupted: bool = False,
 ) -> Decision:
-    """Decide whether MCP can disclose an output or use an earlier watch segment."""
+    """Decide whether to disclose an output or use an earlier watch segment."""
     rid = uuid.uuid4().hex
     reason: Reason = "tray_unavailable"
     current = None
     try:
         current = policy()
         start = start or current
-        if current != start or (required and current.paused and current.enabled):
+        if interrupted or current != start:
+            reason = "settings_changed"
+        elif required and current.paused:
             reason = "denied"
-        elif not required or not current.enabled or previously_approved:
+        elif not required or not current.enabled:
             reason = "not_required"
         else:
             deadline = time.monotonic() + current.timeout
             preview = Preview(rid, tool, shots, text, windows, current.stamp, deadline, allow_trust, watching, query)
             reply = (transport or _transport)(preview)
-            if time.monotonic() >= deadline:
+            if policy_changed(current):
+                reason = "settings_changed"
+            elif time.monotonic() >= deadline:
                 reason = "timeout"
-            elif policy() != current:
-                reason = "denied"
             elif reply in ("user", "denied", "timeout", "tray_unavailable"):
                 reason = reply
             elif reply == "trusted":
                 reason = "trusted" if allow_trust and windows else "denied"
     except TimeoutError:
         reason = "timeout"
-    except (OSError, ValueError, GateStopped):
+    except GateStopped as exc:
+        if str(exc) == SETTINGS_CHANGED:
+            reason = "settings_changed"
+    except (OSError, ValueError):
         pass  # Never include the transport error or preview content in an MCP reply.
+    if start is not None and reason in ("timeout", "tray_unavailable") and policy_changed(start):
+        reason = "settings_changed"
     apps = sorted({exe for _, exe, _ in windows or () if exe})
     decision = Decision(reason in ("user", "trusted", "not_required"), reason, tool, apps, time.time(), rid)
     s = start if start is not None and start.requires_audit else current
@@ -139,6 +160,9 @@ def request(
 
             sent_text = (*text, query) if query else text  # the AI also gets its echoed query back
             audit.log_decision(decision, shots=() if watching else shots, text=sent_text, profile=s.profile, client=client)
+            if reason != "settings_changed" and start is not None and policy_changed(start):
+                decision = replace(decision, approved=False, reason="settings_changed", when=time.time())
+                audit.log_decision(decision, profile=s.profile, client=client)
         except Exception:
             decision = Decision(False, "audit_failed", tool, apps, decision.when, rid)
     return decision

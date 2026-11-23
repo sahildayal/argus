@@ -89,8 +89,8 @@ def _session(pid: int) -> int:
 def _address() -> tuple[str, str]:
     sid = _sid(win.GetCurrentProcess())
     key = f"{sid}:{_session(os.getpid())}:{os.path.normcase(str(home().resolve()))}".encode()
-    # Version 2 requires a separate query field in the approval preview.
-    return rf"\\.\pipe\ArgusApproval-v2-{hashlib.sha256(key).hexdigest()}", sid
+    # Version 3 includes the profile marker and redaction policy in the stamp.
+    return rf"\\.\pipe\ArgusApproval-v3-{hashlib.sha256(key).hexdigest()}", sid
 
 
 def _new_pipe(address: str, sid: str, *, first: bool) -> int:
@@ -266,8 +266,10 @@ def _parse(value: dict) -> Preview:
     if (type(rid) is not str or not re.fullmatch(r"[0-9a-f]{32}", rid)
             or type(tool) is not str or not re.fullmatch(r"[a-z_]{1,40}", tool)
             or type(deadline) not in (int, float) or not time.monotonic() < deadline <= time.monotonic() + 86400
-            or type(stamp) is not list or len(stamp) != 2
-            or any(type(row) is not list or len(row) != 3 or any(type(n) is not int for n in row) for row in stamp)
+            or type(stamp) is not list or len(stamp) != 5
+            or any(type(row) is not list or len(row) != 3 or any(type(n) is not int for n in row) for row in stamp[:3])
+            or stamp[3] not in ("work", "personal", "")
+            or type(stamp[4]) is not str or not re.fullmatch(r"[0-9a-f]{32}", stamp[4])
             or any(type(value[k]) is not bool for k in ("allow_trust", "watching"))):
         raise ValueError("Invalid approval request")
     windows, images, text = (value[k] for k in ("windows", "images", "text"))
@@ -284,7 +286,8 @@ def _parse(value: dict) -> Preview:
     return Preview(
         rid, tool, tuple(base64.b64decode(b, validate=True) for b in images), tuple(text),
         None if windows is None else frozenset((h, exe, pid) for h, exe, pid in windows),
-        (tuple(stamp[0]), tuple(stamp[1])), deadline, value["allow_trust"], value["watching"], value["query"],
+        (tuple(stamp[0]), tuple(stamp[1]), tuple(stamp[2]), stamp[3], stamp[4]),
+        deadline, value["allow_trust"], value["watching"], value["query"],
     )
 
 
