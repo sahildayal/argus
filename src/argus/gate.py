@@ -137,7 +137,8 @@ def request(
         try:
             from . import audit
 
-            audit.log_decision(decision, shots=() if watching else shots, text=text, profile=s.profile, client=client)
+            sent_text = (*text, query) if query else text  # the AI also gets its echoed query back
+            audit.log_decision(decision, shots=() if watching else shots, text=sent_text, profile=s.profile, client=client)
         except Exception:
             decision = Decision(False, "audit_failed", tool, apps, decision.when, rid)
     return decision

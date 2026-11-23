@@ -59,3 +59,23 @@ def test_launchers_ignore_path(name, tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "prefix", str(prefix))
     monkeypatch.setattr(sys, "executable", str(runtime / "python.exe"))
     assert gate_pipe._launchers(name) == {(scripts / f"{name}.exe").resolve(), (runtime / f"{name}.exe").resolve()}
+
+
+def test_mismatched_tray_versions_fail_closed():
+    """An old (v1) tray listens on a different pipe name, so a new server finds no
+    tray and denies; a new tray rejects an old server's request without a query."""
+    import dataclasses
+
+    from argus import gate, gate_pipe
+    from argus.config import set_profile
+
+    set_profile("work")
+    assert gate.request("screenshot", (b"pixels",), ("text",)).reason == "tray_unavailable"
+
+    good = {f.name: None for f in dataclasses.fields(gate.Preview)}
+    good.update(request_id="0" * 32, tool="screenshot", deadline=time.monotonic() + 30, stamp=[[0, 0, 0], [0, 0, 0]],
+                allow_trust=False, watching=False, windows=None, images=[], text=["t"], query="")
+    gate_pipe._parse(dict(good))  # the current shape parses
+    old = {k: v for k, v in good.items() if k != "query"}
+    with pytest.raises(ValueError):
+        gate_pipe._parse(old)
