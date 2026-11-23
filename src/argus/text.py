@@ -5,15 +5,15 @@ from unicodedata import category, combining, normalize
 _ARG_LIMIT = 200
 _MAX_MARKS = 2  # combining marks kept after each base character
 # Default-ignorable or blank-looking characters outside the Cf category.
-_INVISIBLE = frozenset("͏ᅟᅠ឴឵⠀ㅤﾠ")
+_INVISIBLE = frozenset("\u034f\u115f\u1160\u17b4\u17b5\u2800\u3164\uffa0")
 
 
 def _hidden(ch: str) -> bool:
     return (
         category(ch) in {"Cc", "Cf", "Cs", "Co", "Cn"}
         or ch in _INVISIBLE
-        or "᠋" <= ch <= "᠏"
-        or "︀" <= ch <= "️"
+        or "\u180b" <= ch <= "\u180f"
+        or "\ufe00" <= ch <= "\ufe0f"
         or "\U000e0100" <= ch <= "\U000e01ef"
     )
 
