@@ -181,3 +181,16 @@ def test_allow_learn_never_prints_window_titles(argus_home, monkeypatch, capsys)
     output = capsys.readouterr().out
     assert "Doe" not in output and "MRN" not in output and "SECRET TAB" not in output
     assert "Editor.exe" in output and config.settings().allow_apps == {"editor.exe"}
+
+
+def test_set_work_list_hash_inside_string_and_comments(tmp_path, monkeypatch):
+    from argus import config
+    monkeypatch.setenv("ARGUS_HOME", str(tmp_path))
+    config._cache = None
+    (tmp_path / "config.toml").write_text(
+        '[work]\nallow_titles = [\n  "C# notes",  # keep me\n]\nallow_apps = ["Code.exe"]\n', encoding="utf-8")
+    s = config.set_work_list("allow_titles", ["C# notes", "x"])
+    text = (tmp_path / "config.toml").read_text(encoding="utf-8")
+    assert "# keep me" in text and 'pattern"]' not in text
+    assert [p.pattern for p in s.allow_titles] == ["C# notes", "x"]
+    assert s.allow_apps == frozenset({"code.exe"})

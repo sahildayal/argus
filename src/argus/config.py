@@ -268,10 +268,17 @@ def set_work_list(key: str, values) -> Settings:
             original = f.read()
         new = _with_work_list(original, key, values)
         try:
-            parsed = tomllib.loads(new)
+            before, parsed = tomllib.loads(original), tomllib.loads(new)
             result = Settings.from_toml(new)
         except tomllib.TOMLDecodeError as exc:
             raise ValueError(f"{path} isn't valid TOML ({exc}); fix it first") from None
+        # Nothing but [work] <key> may change.
+        for doc in (before, parsed):
+            doc.get("work", {}).pop(key, None)
+            if doc.get("work") == {}:
+                doc.pop("work")
+        if before != parsed:
+            raise ValueError(f"editing [work] {key} would change other settings in {path}; edit it by hand")
         expected = {"allow_apps": result.allow_apps,
                     "allow_browser_titles": tuple(p.pattern for p in result.allow_browser_titles),
                     "allow_titles": tuple(p.pattern for p in result.allow_titles)}[key]
@@ -302,6 +309,7 @@ def _with_work_list(text: str, key: str, values: list[str]) -> str:
             continue
         # Arrays may span lines. Locate the matching bracket while respecting quoted strings.
         depth, quote, escaped, finish = 1, None, False, None
+        comments = []  # comments inside the array, found outside quoted strings
         for j in range(i, end):
             row = lines[j].rstrip("\r\n")
             start = match.end(2) if j == i else 0
@@ -309,8 +317,11 @@ def _with_work_list(text: str, key: str, values: list[str]) -> str:
                 ch = row[k]
                 if quote:
                     if escaped: escaped = False
-                    elif ch == "\\": escaped = True
+                    elif ch == "\\" and quote == '"': escaped = True
                     elif ch == quote: quote = None
+                elif ch == "#":
+                    comments.append(row[k:])
+                    break
                 elif ch in "\"'": quote = ch
                 elif ch == "[": depth += 1
                 elif ch == "]":
@@ -322,11 +333,6 @@ def _with_work_list(text: str, key: str, values: list[str]) -> str:
         if not finish: raise ValueError(f"unterminated [work] {key} array")
         j, k = finish
         suffix = lines[j].rstrip("\r\n")[k:]
-        comments = []
-        for old_line in lines[i:j + 1]:
-            comment = re.search(r"\s+#.*$", old_line.rstrip("\r\n"))
-            if comment:
-                comments.append(comment.group().lstrip())
         replacement = [body[:match.start(2)] + encoded + suffix + (lines[j][len(lines[j].rstrip("\r\n")):])]
         replacement.extend(f"# {comment.lstrip('# ').rstrip()}{newline}" for comment in comments)
         lines[i:j + 1] = replacement

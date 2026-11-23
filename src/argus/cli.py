@@ -366,16 +366,25 @@ def _allow_cmd(args) -> int:
         for i, (app, exe) in enumerate(rows, 1):
             print(f"{i}. {app} — {exe}" + (" (allowed)" if exe.lower() in s.allow_apps else ""))
         print("Enter numbers to allow, e.g. 1 3 5, or 'a' for all, blank to cancel")
-        choice = input("> ").strip().lower()
+        def ask() -> str:
+            try:
+                return input("> ").strip().lower()
+            except EOFError:
+                return ""
+
+        choice = ask()
         if not choice:
             print("Cancelled.")
             return 0
         try:
-            selected = rows if choice == "a" else [rows[int(n) - 1] for n in choice.replace(",", " ").split()]
-        except (ValueError, IndexError):
+            picks = [int(n) for n in choice.replace(",", " ").split()] if choice != "a" else []
+        except ValueError:
             raise ArgusError("enter valid numbers, or 'a'") from None
+        if any(not 1 <= n <= len(rows) for n in picks):
+            raise ArgusError(f"numbers must be between 1 and {len(rows)}")
+        selected = rows if choice == "a" else [rows[n - 1] for n in dict.fromkeys(picks)]
         print("Allow " + ", ".join(exe for _, exe in selected) + "? [y/N]", flush=True)
-        if input("> ").strip().lower() not in {"y", "yes"}:
+        if ask() not in {"y", "yes"}:
             print("Cancelled.")
             return 0
         config.set_work_list("allow_apps", [*s.allow_apps, *(exe for _, exe in selected)])
