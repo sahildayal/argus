@@ -211,7 +211,19 @@ argus wait text --text "Compiled successfully" -w "Terminal" -t 120   # exit 0 =
 argus baseline save login -w "localhost:3000"; argus baseline compare login
 argus pause --minutes 30; argus resume; argus status
 argus profile; argus profile work             # show / switch the privacy profile
+argus allow                                   # show the work allow list
+argus allow --learn                           # choose open/recent apps without showing their window titles
+argus allow add Code.exe WindowsTerminal.exe
+argus allow remove Code.exe
+argus allow add-title '^Jira'                  # match any window title
+argus allow add-title '\\blocalhost\\b' --browser # match browser tab titles
+argus allow remove-title '^Jira'
 ```
+
+`argus allow` edits the `[work]` lists in `~/.argus/config.toml`. Learning lists
+friendly app names and executable names only; it never captures a screenshot or
+prints window titles. Use `--browser` with `add-title` or `remove-title` for
+browser tab patterns.
 
 ## Settings: `~/.argus/config.toml`
 

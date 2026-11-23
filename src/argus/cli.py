@@ -106,6 +106,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="paused or not, paths, hotkeys")
     p = sub.add_parser("profile", help="show or switch the privacy profile (work = only allowed apps are visible)")
     p.add_argument("name", nargs="?", choices=["personal", "work"])
+    p = sub.add_parser("allow", help="manage apps and title patterns visible in the work profile")
+    p.add_argument("action", nargs="?", choices=["add", "remove", "add-title", "remove-title"])
+    p.add_argument("values", nargs="*")
+    p.add_argument("--learn", action="store_true", help="choose from open and recently focused apps")
+    p.add_argument("--browser", action="store_true", help="apply a title pattern to browser tabs")
     p = sub.add_parser("cleanup", help="delete captures older than the retention period")
     p.add_argument("--all", action="store_true", help="delete every saved capture and mark now")
 
@@ -196,6 +201,8 @@ def _run(args) -> int | None:
         return _privacy_cmd(args)
     if cmd == "profile":
         return _profile_cmd(args)
+    if cmd == "allow":
+        return _allow_cmd(args)
 
     from .service import Session
 
@@ -325,6 +332,79 @@ def _profile_cmd(args) -> int:
         print("Everything is visible except the [privacy] block list. `argus profile work` switches to the allow list.")
     for problem in s.problems:
         print(f"Config problem: {problem}")
+    return 0
+
+
+def _allow_cmd(args) -> int:
+    from . import config, privacy
+    from .desktop import NO_HOST, _SHELL_CLASSES, _SHELL_PROCESSES, snapshot
+    from .service import Session
+
+    s = config.settings()
+    if args.learn:
+        if args.action or args.values or args.browser:
+            raise ArgusError("use `argus allow --learn` by itself")
+        desk = snapshot(NO_HOST)
+        tracker = Session(track=True).tracker
+        try:
+            history = tracker.recent() if tracker else []
+            by_hwnd = {w.hwnd: w for w in desk.layers}
+            candidates = {}
+            for w in [*desk.windows, *(by_hwnd[h] for _, h in history if h in by_hwnd)]:
+                exe = w.process.strip()
+                if (not w.is_app or not exe or not exe.lower().endswith(".exe") or not w.pid
+                        or w.cls in _SHELL_CLASSES or exe.lower() in _SHELL_PROCESSES
+                        or exe.lower() in {"argus.exe", "argus-tray.exe", "python.exe", "pythonw.exe"}):
+                    continue
+                candidates.setdefault(exe.lower(), (w.app or exe, exe))
+        finally:
+            if tracker: tracker.stop()
+        rows = sorted(candidates.values(), key=lambda x: x[0].casefold())
+        if not rows:
+            print("No eligible apps found.")
+            return 0
+        for i, (app, exe) in enumerate(rows, 1):
+            print(f"{i}. {app} — {exe}" + (" (allowed)" if exe.lower() in s.allow_apps else ""))
+        print("Enter numbers to allow, e.g. 1 3 5, or 'a' for all, blank to cancel")
+        choice = input("> ").strip().lower()
+        if not choice:
+            print("Cancelled.")
+            return 0
+        try:
+            selected = rows if choice == "a" else [rows[int(n) - 1] for n in choice.replace(",", " ").split()]
+        except (ValueError, IndexError):
+            raise ArgusError("enter valid numbers, or 'a'") from None
+        print("Allow " + ", ".join(exe for _, exe in selected) + "? [y/N]", flush=True)
+        if input("> ").strip().lower() not in {"y", "yes"}:
+            print("Cancelled.")
+            return 0
+        config.set_work_list("allow_apps", [*s.allow_apps, *(exe for _, exe in selected)])
+        print("Updated allowed apps.")
+        return 0
+    if not args.action:
+        print("Allowed apps: " + (", ".join(sorted(s.allow_apps)) or "none"))
+        print("Allowed browser title patterns: " + (", ".join(p.pattern for p in s.allow_browser_titles) or "none"))
+        print("Allowed title patterns: " + (", ".join(p.pattern for p in s.allow_titles) or "none"))
+        return 0
+    if args.action in ("add", "remove"):
+        if not args.values or any(not v.lower().endswith(".exe") for v in args.values):
+            raise ArgusError("provide one or more executable names ending in .exe")
+        current = list(s.allow_apps)
+        if args.action == "add": current.extend(args.values)
+        else:
+            removed = {v.lower() for v in args.values}
+            current = [v for v in current if v.lower() not in removed]
+        config.set_work_list("allow_apps", current)
+    else:
+        if len(args.values) != 1:
+            raise ArgusError(f"{args.action} requires one regex")
+        key = "allow_browser_titles" if args.browser else "allow_titles"
+        patterns = list(getattr(s, key))
+        values = [p.pattern for p in patterns]
+        if args.action == "add-title": values.append(args.values[0])
+        else: values = [v for v in values if v != args.values[0]]
+        config.set_work_list(key, values)
+    print("Updated work allow list.")
     return 0
 
 
