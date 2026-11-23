@@ -14,6 +14,7 @@ import threading
 import time
 import tkinter as tk
 from ctypes import wintypes
+from pathlib import Path
 
 import pystray
 from PIL import Image, ImageDraw
@@ -22,9 +23,9 @@ from . import privacy, win32
 from .capture import capture_monitor, capture_window
 from .config import config_path, home, parse_hotkey, pretty_hotkey, set_profile, settings, tray_mutex_name
 from .desktop import NO_HOST, ArgusError, set_host, snapshot
+from .errors import log_unexpected
 from .gate_pipe import PipeServer
 from .gate_ui import Approvals
-from .errors import log_unexpected
 from .geometry import Rect
 from .marks import marks_dir, save_mark
 
@@ -89,6 +90,7 @@ class TrayApp:
         self.root.withdraw()
         self.approvals = Approvals(self.root)
         self.pipe = PipeServer(self.approvals.answer)
+        self.pipe_ok = False
         s = settings()
         self.hotkeys = Hotkeys(self.events, {1: ("mark", s.hotkey_mark), 2: ("pause", s.hotkey_pause)})
         self.paused = privacy.pause_state().paused
@@ -106,6 +108,8 @@ class TrayApp:
         )
         if s.work and s.configured != "work":
             title += "\nWork kept on" + (" with nothing allowed" if s.lockdown else "") + ": see `argus status`"
+        if not self.pipe_ok:
+            title += "\nApprovals unavailable: see `argus status`"
         if s.problems:
             title += f"\nConfig problem ({len(s.problems)}): see `argus status`"
         return title[:127]  # the notification-area tooltip limit
@@ -159,10 +163,14 @@ class TrayApp:
     def run(self) -> None:
         try:
             self.pipe.start()
+            self.pipe_ok = True
         except OSError:
             log.warning("Could not start the Argus approval pipe")
         self.hotkeys.start()
+        self.icon.title = self._title()
         self.icon.run_detached()
+        if not self.pipe_ok:
+            self.root.after(1500, self._pipe_failed)
         self.root.after(50, self._poll)
         self.root.after(1000, self._tick)
         log.info("tray started")
@@ -171,6 +179,16 @@ class TrayApp:
         finally:
             self.approvals.close()
             self.pipe.close()
+
+    def _pipe_failed(self) -> None:
+        """Approvals can't reach this tray, so every capture that needs one is refused."""
+        message = ("Argus can't show approval prompts, so captures that need approval are refused. "
+                   "Quit any other Argus tray (e.g. an old version), then restart argus-tray. See `argus status`.")
+        try:
+            self.icon.notify(message, "Argus approvals unavailable")
+        except Exception as exc:
+            log_unexpected(log, exc, "notify")
+        self.pill("Argus approvals unavailable: see argus status", WARN, ms=4000)
 
     def _poll(self) -> None:
         try:

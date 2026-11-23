@@ -31,6 +31,26 @@ def _box(text: str) -> list[float]:
     return [float(p) for p in parts]
 
 
+def _utc_date(text: str) -> str:
+    from datetime import datetime
+
+    try:
+        datetime.strptime(text.strip(), "%Y-%m-%d")
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a date; use YYYY-MM-DD (UTC)") from None
+    return text.strip()
+
+
+def _count(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number of entries (0 = all)")
+    return value
+
+
 def _targets(p: argparse.ArgumentParser) -> None:
     p.add_argument("-m", "--monitor", help='number (1 = leftmost), left/center/right/top/bottom, primary, laptop, cursor, active, all')
     p.add_argument("-w", "--window", help='part of a title or app name, "active", "under_cursor", or a handle like 0x1A2B3C')
@@ -103,25 +123,28 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("pause", help="block all captures (from every AI tool)")
     p.add_argument("--minutes", type=float, help="resume automatically after this long")
     sub.add_parser("resume", help="allow captures again")
-    sub.add_parser("status", help="paused or not, paths, hotkeys")
+    sub.add_parser("status", help="paused or not, profile, approvals, audit, tray, config problems")
     p = sub.add_parser("profile", help="show or switch the privacy profile (work = only allowed apps are visible)")
     p.add_argument("name", nargs="?", choices=["personal", "work"])
     p = sub.add_parser("allow", help="manage apps and title patterns visible in the work profile")
     p.add_argument("action", nargs="?", choices=["add", "remove", "add-title", "remove-title"])
     p.add_argument("values", nargs="*")
-    p.add_argument("--learn", action="store_true", help="choose from open and recently focused apps")
+    p.add_argument("--learn", action="store_true", help="choose from the apps that have windows open now")
     p.add_argument("--browser", action="store_true", help="apply a title pattern to browser tabs")
     p = sub.add_parser("cleanup", help="delete captures older than the retention period")
     p.add_argument("--all", action="store_true", help="delete every saved capture and mark now")
 
-    p = sub.add_parser("audit", help="gate decision audit log")
-    p.add_argument("--since", help="filter entries since ISO date (YYYY-MM-DD)")
-    p.add_argument("-n", "--count", type=int, default=20, help="max entries to show (default 20)")
+    since_help = "only entries on or after this UTC date (YYYY-MM-DD)"
+    p = sub.add_parser("audit", help="approval-gate audit log (times are UTC)")
+    p.add_argument("--since", type=_utc_date, help=since_help)
+    p.add_argument("-n", "--count", type=_count, default=20,
+                   help="show the newest N matching entries (default 20, 0 = all); applies with --since too")
     asub = p.add_subparsers(dest="audit_action", required=False)
-    asub.add_parser("verify", help="verify tamper-evidence hash chain")
-    e = asub.add_parser("export", help="copy audit log to a file for compliance")
+    asub.add_parser("verify", help="check the tamper-evidence hash chain")
+    e = asub.add_parser("export", help="copy the audit log to a .jsonl file for compliance")
     e.add_argument("-o", "--out", type=Path, required=True, help="output .jsonl file")
-    e.add_argument("--since", help="filter entries since ISO date (YYYY-MM-DD)")
+    # SUPPRESS: `argus audit --since D export ...` keeps the date given before the subcommand.
+    e.add_argument("--since", type=_utc_date, default=argparse.SUPPRESS, help=since_help)
 
     sub.add_parser("tray", help="run the tray app (hotkeys) in this console")
     sub.add_parser("mcp", help="run the MCP server on stdio")
@@ -134,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("uninstall", help="remove Argus from your AI tools and Windows startup")
     p.add_argument("--purge", action="store_true", help="also delete ~/.argus (captures, marks, baselines, settings)")
-    sub.add_parser("doctor", help="check that everything works")
+    sub.add_parser("doctor", help="check monitors, OCR, approvals, audit, the tray and each registration")
     return ap
 
 
@@ -315,20 +338,40 @@ def _baseline(session, args) -> int:
     return 0
 
 
+_VERIFY_HINTS = (
+    ("truncat", "Entries are missing from the end of the log: audit/head.json records more entries than the files "
+                "hold (a crash, a restored backup or a deleted file). This catches accidental loss; it is not proof "
+                "against someone who can edit files as you."),
+    ("anchor", "The pruning record (audit/anchor.json) doesn't match the monthly files that are left, e.g. a month "
+               "was deleted or restored by hand."),
+    ("chain broken", "A line was changed, removed or inserted at that point, so it and every later entry are "
+                     "unverified."),
+    ("incomplete line", "A write was cut off (crash or power loss). Argus continues the chain after it, so this "
+                        "alone is not tampering."),
+)
+
+
+def _explain_verify(message: str) -> str:
+    """`argus audit verify`'s result plus a plain-language line per problem type."""
+    lower = message.lower()
+    hints = [hint for needle, hint in _VERIFY_HINTS if needle in lower]
+    return "\n".join([message, *(f"What this means: {hint}" for hint in hints)])
+
+
 def _audit_cmd(args) -> int:
     from . import audit
 
     action = getattr(args, "audit_action", None)
+    since = getattr(args, "since", None)
     if action == "verify":
-        valid, msg = audit.verify_chain()
+        valid, message = audit.verify_chain()
+        text = _explain_verify(message)
         if valid:
-            print(msg)
+            print(text)
             return 0
-        else:
-            print(f"argus audit: {msg}", file=sys.stderr)
-            return 1
-    elif action == "export":
-        since = getattr(args, "since", None)
+        print(f"argus audit: {text}", file=sys.stderr)
+        return 1
+    if action == "export":
         out = args.out
         try:
             count = audit.export_log(
@@ -339,12 +382,67 @@ def _audit_cmd(args) -> int:
             return 1
         print(f"Exported {count} audit entry(ies) to {out}")
         return 0
+    entries = audit.read_entries(since=since, limit=None)
+    if args.count:
+        entries = entries[-args.count:]
+    print(audit.format_table(entries))
+    if entries:
+        print("Times are UTC.")
+    return 0
+
+
+# Shown when approvals are needed but the tray can't take them. gate.py's own
+# message to the AI stays short; this is the longer version for the user.
+APPROVAL_HELP = ("start or restart argus-tray; if you upgraded Argus, quit the old tray (tray menu > Quit Argus tray) "
+                 "and start the new one; if config.toml has problems, fix the ones `argus status` lists")
+
+
+def _pipe_state() -> str:
+    """'verified', 'unverified', 'missing', 'busy' or 'error' (see gate_pipe.probe)."""
+    try:
+        from .gate_pipe import probe
+
+        return probe()
+    except Exception:
+        return "error"
+
+
+_PIPE_TEXT = {
+    "verified": "reachable and verified (approvals will show)",
+    "unverified": "found, but its owner isn't a verified Argus tray from this install",
+    "missing": "not found",
+    "busy": "busy (every connection in use); try again",
+    "error": "couldn't be checked",
+}
+
+
+def diagnostics(s=None) -> list[str]:
+    """Approval gate, audit log, tray and config lines for `argus status` and `argus doctor`."""
+    from .config import home, settings
+    from .install import tray_running
+
+    s = s or settings()
+    if s.work:
+        gate = "on (the work profile always asks in the tray)"
+        audit = f"on (the work profile always logs), {home() / 'audit'}"
     else:
-        since = getattr(args, "since", None)
-        count = getattr(args, "count", 20)
-        entries = audit.read_entries(since=since, limit=None if since else count)
-        print(audit.format_table(entries))
-        return 0
+        gate = "on ([gate] enabled = true)" if s.gate_enabled else "off (personal; [gate] enabled = true turns it on)"
+        audit = (f"on ([audit] enabled = true), {home() / 'audit'}" if s.audit_enabled
+                 else "off (personal; [audit] enabled = true turns it on)")
+    try:
+        running = "yes" if tray_running() else "no"
+    except Exception:
+        running = "unknown"
+    pipe = _pipe_state()
+    lines = [
+        f"Approval gate: {gate}",
+        f"Audit log: {audit}",
+        f"Tray process running: {running}; approval pipe: {_PIPE_TEXT.get(pipe, pipe)}",
+    ]
+    if s.requires_approval and pipe != "verified":
+        lines.append(f"Approvals are UNAVAILABLE, so every capture is refused. To fix: {APPROVAL_HELP}.")
+    lines.append(f"Config problems: {len(s.problems)}" if s.problems else "Config problems: none")
+    return lines
 
 
 def _privacy_cmd(args) -> int:
@@ -360,6 +458,8 @@ def _privacy_cmd(args) -> int:
         print("Argus resumed.")
     elif args.cmd == "status":
         print(status_text())
+        for line in diagnostics():
+            print(line)
     elif args.cmd == "cleanup":
         if args.all:
             privacy.purge_all()
@@ -396,8 +496,11 @@ def _profile_cmd(args) -> int:
         if s.allow_browser_titles or s.allow_titles:
             print("Note: title patterns match titles that pages/programs set themselves - a convenience, not a security "
                   "boundary. For strict control, allow a dedicated browser by exe name instead.")
-        if not (s.allow_apps or s.allow_browser_titles or s.allow_titles):
-            print(f"Nothing is allowed yet, so captures will be fully black. Add apps under [work] in {config.config_path()}.")
+        if s.lockdown:
+            print("Nothing is allowed until the config problem(s) below are fixed, so captures will be fully black.")
+        elif not (s.allow_apps or s.allow_browser_titles or s.allow_titles):
+            print("Nothing is allowed yet, so captures will be fully black. Run `argus allow --learn` to pick apps "
+                  f"from the ones you have open, or add them under [work] in {config.config_path()}.")
     else:
         print("Everything is visible except the [privacy] block list. `argus profile work` switches to the allow list.")
     for problem in s.problems:
@@ -405,85 +508,139 @@ def _profile_cmd(args) -> int:
     return 0
 
 
-def _allow_cmd(args) -> int:
-    from . import config, privacy
-    from .desktop import NO_HOST, _SHELL_CLASSES, _SHELL_PROCESSES, snapshot
-    from .service import Session
+_LIST_LABELS = {
+    "allow_apps": "Allowed apps",
+    "allow_browser_titles": "Allowed browser-tab patterns",
+    "allow_titles": "Allowed title patterns",
+}
 
-    s = config.settings()
+
+def _refuse_if_problems(problems) -> None:
+    if problems:
+        for problem in problems:
+            print(f"Config problem: {problem}", file=sys.stderr)
+        raise ArgusError("config.toml has the problem(s) above, so `argus allow` won't edit it. Fix them first "
+                         "(`argus status` lists them too).")
+
+
+def _edit_allow_list(key: str, add=(), remove=()) -> tuple[list[str], list[str]]:
+    from . import config
+
+    try:
+        return config.edit_work_list(key, add=add, remove=remove)
+    except config.ConfigProblems as exc:
+        _refuse_if_problems(exc.problems)
+        raise
+    except ValueError as exc:
+        raise ArgusError(f"couldn't update the allow list: {exc}") from None
+
+
+def _allow_cmd(args) -> int:
+    from . import config
+
     if args.learn:
         if args.action or args.values or args.browser:
             raise ArgusError("use `argus allow --learn` by itself")
-        desk = snapshot(NO_HOST)
-        tracker = Session(track=True).tracker
-        try:
-            history = tracker.recent() if tracker else []
-            by_hwnd = {w.hwnd: w for w in desk.layers}
-            candidates = {}
-            for w in [*desk.windows, *(by_hwnd[h] for _, h in history if h in by_hwnd)]:
-                exe = w.process.strip()
-                if (not w.is_app or not exe or not exe.lower().endswith(".exe") or not w.pid
-                        or w.cls in _SHELL_CLASSES or exe.lower() in _SHELL_PROCESSES
-                        or exe.lower() in {"argus.exe", "argus-tray.exe", "python.exe", "pythonw.exe"}):
-                    continue
-                candidates.setdefault(exe.lower(), (w.app or exe, exe))
-        finally:
-            if tracker: tracker.stop()
-        rows = sorted(candidates.values(), key=lambda x: x[0].casefold())
-        if not rows:
-            print("No eligible apps found.")
-            return 0
-        for i, (app, exe) in enumerate(rows, 1):
-            print(f"{i}. {app} — {exe}" + (" (allowed)" if exe.lower() in s.allow_apps else ""))
-        print("Enter numbers to allow, e.g. 1 3 5, or 'a' for all, blank to cancel")
-        def ask() -> str:
-            try:
-                return input("> ").strip().lower()
-            except EOFError:
-                return ""
-
-        choice = ask()
-        if not choice:
-            print("Cancelled.")
-            return 0
-        try:
-            picks = [int(n) for n in choice.replace(",", " ").split()] if choice != "a" else []
-        except ValueError:
-            raise ArgusError("enter valid numbers, or 'a'") from None
-        if any(not 1 <= n <= len(rows) for n in picks):
-            raise ArgusError(f"numbers must be between 1 and {len(rows)}")
-        selected = rows if choice == "a" else [rows[n - 1] for n in dict.fromkeys(picks)]
-        print("Allow " + ", ".join(exe for _, exe in selected) + "? [y/N]", flush=True)
-        if ask() not in {"y", "yes"}:
-            print("Cancelled.")
-            return 0
-        config.set_work_list("allow_apps", [*s.allow_apps, *(exe for _, exe in selected)])
-        print("Updated allowed apps.")
-        return 0
+        return _allow_learn()
     if not args.action:
-        print("Allowed apps: " + (", ".join(sorted(s.allow_apps)) or "none"))
-        print("Allowed browser title patterns: " + (", ".join(p.pattern for p in s.allow_browser_titles) or "none"))
-        print("Allowed title patterns: " + (", ".join(p.pattern for p in s.allow_titles) or "none"))
-        return 0
+        return _allow_show()
+    _refuse_if_problems(config.settings().problems)  # checked again under the edit lock
     if args.action in ("add", "remove"):
-        if not args.values or any(not v.lower().endswith(".exe") for v in args.values):
-            raise ArgusError("provide one or more executable names ending in .exe")
-        current = list(s.allow_apps)
-        if args.action == "add": current.extend(args.values)
-        else:
-            removed = {v.lower() for v in args.values}
-            current = [v for v in current if v.lower() not in removed]
-        config.set_work_list("allow_apps", current)
+        if args.browser:
+            raise ArgusError("--browser only applies to add-title and remove-title")
+        if not args.values:
+            raise ArgusError(f"give one or more program names ending in .exe, e.g. argus allow {args.action} Code.exe")
+        if args.action == "add" and any(not v.lower().endswith(".exe") for v in args.values):
+            raise ArgusError("program names must end in .exe (the process name, e.g. Code.exe)")
+        key = "allow_apps"
     else:
         if len(args.values) != 1:
-            raise ArgusError(f"{args.action} requires one regex")
+            raise ArgusError(f"{args.action} takes exactly one regex; quote it, e.g. argus {args.cmd} {args.action} '^Jira'")
         key = "allow_browser_titles" if args.browser else "allow_titles"
-        patterns = list(getattr(s, key))
-        values = [p.pattern for p in patterns]
-        if args.action == "add-title": values.append(args.values[0])
-        else: values = [v for v in values if v != args.values[0]]
-        config.set_work_list(key, values)
-    print("Updated work allow list.")
+    adding = args.action.startswith("add")
+    before, after = _edit_allow_list(key, add=args.values if adding else (), remove=() if adding else args.values)
+    fold = str.lower if key == "allow_apps" else str
+    had = {fold(v) for v in before}
+    for value in args.values:
+        if adding and fold(value) in had:
+            print(f"{value} was already in the list.")
+        elif not adding and fold(value) not in had:
+            print(f"{value} wasn't in the list.")
+    if before != after:
+        print("Updated the work allow list.")
+    print(f"{_LIST_LABELS[key]}: {', '.join(after) or 'none'}")
+    if not config.settings().work:
+        print("Note: allow lists only apply in the work profile (argus profile work).")
+    return 0
+
+
+def _allow_show() -> int:
+    from . import config
+
+    s = config.settings()
+    raw = config.raw_work_lists()
+    for problem in s.problems:
+        print(f"Config problem: {problem}")
+    for key, label in _LIST_LABELS.items():
+        value = raw[key]
+        print(f"{label}: " + ("(can't be read: see the config problems)" if value is None else ", ".join(value) or "none"))
+    if s.lockdown:
+        print("These lists are NOT in effect: because of the config problem(s), the work profile allows nothing "
+              "until config.toml is fixed.")
+    elif not s.work:
+        print("These lists apply only in the work profile (argus profile work).")
+    return 0
+
+
+def _allow_learn() -> int:
+    from . import config
+    # Private names: desktop.py has no public "is this a shell surface" helper yet.
+    from .desktop import _SHELL_CLASSES, _SHELL_PROCESSES, NO_HOST, snapshot
+
+    _refuse_if_problems(config.settings().problems)
+    allowed = {v.lower() for v in config.raw_work_lists()["allow_apps"] or ()}
+    candidates: dict[str, tuple[str, str]] = {}
+    for w in snapshot(NO_HOST).windows:
+        exe = w.process.strip()
+        if (not w.is_app or not exe or not exe.lower().endswith(".exe") or not w.pid
+                or w.cls in _SHELL_CLASSES or exe.lower() in _SHELL_PROCESSES
+                or exe.lower() in {"argus.exe", "argus-tray.exe", "python.exe", "pythonw.exe"}):
+            continue
+        candidates.setdefault(exe.lower(), (w.app or exe, exe))
+    rows = sorted(candidates.values(), key=lambda x: x[0].casefold())
+    if not rows:
+        print("No eligible apps have windows open. Open the apps you want to allow, then run this again.")
+        return 0
+    print("Apps with windows open now (window titles are never shown):")
+    for i, (app, exe) in enumerate(rows, 1):
+        print(f"{i}. {app} - {exe}" + (" (allowed)" if exe.lower() in allowed else ""))
+    print("Enter numbers to allow, e.g. 1 3 5, or 'a' for all, blank to cancel")
+
+    def ask() -> str:
+        try:
+            return input("> ").strip().lower()
+        except EOFError:
+            return ""
+
+    choice = ask()
+    if not choice:
+        print("Cancelled.")
+        return 0
+    try:
+        picks = [int(n) for n in choice.replace(",", " ").split()] if choice != "a" else []
+    except ValueError:
+        raise ArgusError("enter valid numbers, or 'a'") from None
+    if any(not 1 <= n <= len(rows) for n in picks):
+        raise ArgusError(f"numbers must be between 1 and {len(rows)}")
+    selected = rows if choice == "a" else [rows[n - 1] for n in dict.fromkeys(picks)]
+    print("Allow " + ", ".join(exe for _, exe in selected) + "? [y/N]", flush=True)
+    if ask() not in {"y", "yes"}:
+        print("Cancelled.")
+        return 0
+    _, after = _edit_allow_list("allow_apps", add=[exe for _, exe in selected])
+    print(f"Updated allowed apps: {', '.join(after) or 'none'}")
+    if not config.settings().work:
+        print("Note: allow lists only apply in the work profile (argus profile work).")
     return 0
 
 

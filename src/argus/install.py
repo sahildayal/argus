@@ -387,6 +387,7 @@ def uninstall(args) -> int:
 
 def doctor(_args) -> int:
     from . import privacy, win32
+    from .cli import diagnostics
     from .config import settings
     from .desktop import snapshot
     from .snips import screenshots_dir
@@ -405,7 +406,10 @@ def doctor(_args) -> int:
         print(f"OCR: NOT available ({exc})")
     print(f"Captures: {privacy.pause_state().describe()}; data in {home()}")
     print(f"Snips folder: {screenshots_dir()}")
-    print(f"Tray app: {'running' if tray_running() else 'not running'}; startup shortcut: {'yes' if STARTUP_LINK.exists() else 'no'}")
+    print(f"Profile: {s.profile}" + (f" ({s.profile_reason})" if s.work and s.profile_reason else ""))
+    print(f"Tray startup shortcut: {'yes' if STARTUP_LINK.exists() else 'no (argus install adds it)'}")
+    for line in diagnostics(s):
+        print(line)
     for problem in s.problems:
         print(f"Config problem: {problem}")
     for client in CLIENTS:

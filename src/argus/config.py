@@ -8,7 +8,9 @@ import json
 import math
 import os
 import re
+import tempfile
 import threading
+import time
 import tomllib
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -102,6 +104,7 @@ browsers = [
 # blacked out, and its title is replaced by "<app> (hidden, work profile)".
 # Programs whose windows are allowed (exe names, any case), e.g.
 #   allow_apps = ["Code.exe", "WindowsTerminal.exe", "devenv.exe"]
+# `argus allow --learn` lets you pick them from the apps you have open.
 allow_apps = []
 # Regexes (case-insensitive) matched against browser window titles, i.e. the
 # active tab's title. Switching to a tab that doesn't match hides the window
@@ -169,6 +172,8 @@ def tray_mutex_name() -> str:
     if path == default:
         return "Local\\ArgusTray"
     return "Local\\ArgusTray-" + hashlib.sha256(path.encode()).hexdigest()
+
+
 # What config.toml may contain. STRS = a list of strings; NUMBER = int or float.
 STRS, NUMBER = "list of strings", "number"
 _SCHEMA: dict[str, dict[str, object]] = {
@@ -192,8 +197,10 @@ _SCHEMA: dict[str, dict[str, object]] = {
 _CRITICAL = {"profile", "privacy", "work"}
 # An unknown section this close (edit distance) to one of these is taken for a
 # misspelling of it - e.g. [profiles] or [privcy] - and counts as a critical problem.
-_TYPO_TARGETS = ("profile", "privacy", "work", "gate")
+_TYPO_TARGETS = ("profile", "privacy", "work", "gate", "audit")
 _TYPO_DISTANCE = 2
+# Settings that the default file leaves commented out.
+_OPTIONAL_DEFAULTS = {("gate", "enabled"): False, ("audit", "enabled"): False}
 
 
 def _distance(a: str, b: str) -> int:
@@ -276,6 +283,7 @@ class Settings:
     @property
     def requires_approval(self) -> bool:
         return self.work or self.gate_enabled
+
     @cached_property
     def policy(self) -> str:
         """A short hash of everything that decides what the AI may see (profile,
@@ -343,23 +351,21 @@ class Settings:
                 for key in value:
                     if key not in _SCHEMA[section]:
                         bad(section, f"{section}.{key}: unknown setting (typo?)")
-        gate = data.get("gate") if isinstance(data.get("gate"), dict) else {}
 
-        audit = data.get("audit", {})
-        if not isinstance(audit, dict):
-            problems.append("audit: expected a table; using the defaults")
-            audit = {}
+        def default(section: str, key: str):
+            # [gate]/[audit] enabled is commented out in the default file.
+            return defaults.get(section, {}).get(key, _OPTIONAL_DEFAULTS.get((section, key)))
 
         def get(section: str, key: str):
             sect = data.get(section)
             if not isinstance(sect, dict) or key not in sect:
-                return defaults[section][key]
+                return default(section, key)
             value, kind = sect[key], _SCHEMA[section][key]
             if _type_ok(value, kind):
                 return value
             # The value itself is never echoed: problems are shown to the AI.
             bad(section, f"{section}.{key}: should be {_kind_name(kind)}, not {type(value).__name__}; using the default")
-            return defaults[section][key]
+            return default(section, key)
 
         def patterns(section: str, key: str) -> tuple[re.Pattern, ...]:
             out = []
@@ -371,18 +377,18 @@ class Settings:
             return tuple(out)
 
         def gate_duration(key: str) -> float:
-            value = gate.get(key, defaults["gate"][key])
-            if type(value) in (int, float) and 0 < value <= 86400 and math.isfinite(value):
+            value = get("gate", key)  # reports a wrong type
+            if 0 < value <= 86400 and math.isfinite(value):
                 return float(value)
-            problems.append(f"gate.{key}: expected a positive number up to 86400; using the default")
+            bad("gate", f"gate.{key}: should be a positive number up to 86400; using the default")
             return float(defaults["gate"][key])
 
         def audit_retention() -> int:
-            val = audit.get("retention_months", defaults.get("audit", {}).get("retention_months", 12))
-            if type(val) is int and val > 0:
-                return val
-            problems.append("audit.retention_months: expected a positive integer; using the default")
-            return 12
+            value = get("audit", "retention_months")  # reports a wrong type
+            if value > 0:
+                return value
+            bad("audit", "audit.retention_months: should be a positive whole number; using the default")
+            return int(defaults["audit"]["retention_months"])
 
         sect = data.get("profile")
         raw = sect.get("active", "personal") if isinstance(sect, dict) else "personal"
@@ -412,11 +418,12 @@ class Settings:
             allow_titles=patterns("work", "allow_titles"),
             allow_snip_folder=bool(get("work", "allow_snip_folder")),
             allow_clipboard_files=bool(get("work", "allow_clipboard_files")),
-            gate_enabled=gate.get("enabled") is True,
+            # Personal opt-ins only: the work profile always asks and audits
+            # (Settings.requires_approval / requires_audit), whatever these say.
+            gate_enabled=get("gate", "enabled") is True,
             gate_timeout_seconds=gate_duration("timeout_seconds"),
             gate_trust_minutes=gate_duration("trust_minutes"),
-            # Personal opt-in only: the work profile always audits (Settings.requires_audit).
-            audit_enabled=audit.get("enabled") is True,
+            audit_enabled=get("audit", "enabled") is True,
             audit_retention_months=audit_retention(),
         )
         # Fail closed: an unreadable file or a broken [profile] means work; a
@@ -523,132 +530,311 @@ def set_profile(name: str) -> Settings:
 
 
 def _set_profile_line(name: str) -> None:
+    _edit_config("profile", "active", lambda text, _doc: (name, _with_profile(text, name)),
+                 fallback=f'set it to "{name}" by hand')
+
+
+# ------------------------------------------------------------- config editing
+
+
+class ConfigProblems(ValueError):
+    """config.toml has problems, so Argus won't edit it for you."""
+
+    def __init__(self, problems: tuple[str, ...]):
+        self.problems = tuple(problems)
+        super().__init__("config.toml has problems; fix them first (see `argus status`)")
+
+
+_LOCK_TIMEOUT = 10.0
+
+
+class _ConfigLock:
+    """Inter-process lock (``config.toml.lock``) held across a read-modify-write
+    of config.toml, so two `argus` processes can't interleave their edits."""
+
+    def __init__(self, path: Path, timeout: float | None = None):
+        self.path = path.with_name(path.name + ".lock")
+        self.timeout = _LOCK_TIMEOUT if timeout is None else timeout
+        self.fd: int | None = None
+
+    def __enter__(self) -> _ConfigLock:
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0))
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                _lock_byte(fd)
+                self.fd = fd
+                return self
+            except OSError:
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    raise ValueError(f"{self.path.parent / self.path.stem} is being edited by another Argus process; "
+                                     "try again") from None
+                time.sleep(0.02)
+
+    def __exit__(self, *_exc) -> None:
+        if self.fd is not None:
+            try:
+                _unlock_byte(self.fd)
+            except OSError:
+                pass
+            finally:
+                os.close(self.fd)
+                self.fd = None
+
+
+def _lock_byte(fd: int) -> None:
+    try:
+        import msvcrt
+    except ImportError:  # pragma: no cover - Argus is Windows-only
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+
+def _unlock_byte(fd: int) -> None:
+    try:
+        import msvcrt
+    except ImportError:  # pragma: no cover
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
+def _read_config_text(path: Path) -> str:
+    with open(path, encoding="utf-8", newline="") as f:  # keep the file's line endings
+        return f.read()
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write via a uniquely named temp file in the same folder, then os.replace."""
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        for attempt in range(20):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:  # a reader has the file open for a moment
+                if attempt == 19:
+                    raise
+                time.sleep(0.05)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _edit_config(section: str, key: str, plan, *, fallback: str) -> None:
+    """Set ``[section] key`` in config.toml by a text edit that keeps the user's
+    comments and layout. ``plan(text, parsed)`` returns ``(value, new_text)``
+    (``new_text`` None: nothing to change). Under the config lock, the edit is
+    verified by parsing before and after - only that key may change, to exactly
+    that value - and the file is re-read just before replacing it, so an edit
+    saved meanwhile by another program is never overwritten."""
     global _cache
     path = config_path()
-    with _lock:
-        with open(path, encoding="utf-8", newline="") as f:  # keep the file's line endings
-            text = f.read()
+    with _ConfigLock(path):
+        original = _read_config_text(path)
         try:
-            old = tomllib.loads(text)
+            before = tomllib.loads(original)
         except tomllib.TOMLDecodeError as exc:
-            raise ValueError(f"{path} isn't valid TOML ({exc}); fix it first, then switch profiles") from None
-        if "profile" in old and not isinstance(old["profile"], dict):
-            raise ValueError(f"{path} has a 'profile' value that isn't a [profile] section; fix it first")
-        new = _with_profile(text, name)
+            raise ValueError(f"{path} isn't valid TOML ({exc}); fix it first") from None
+        if section in before and not isinstance(before[section], dict):
+            raise ValueError(f"{path} has a '{section}' value that isn't a [{section}] section; fix it first")
+        value, new = plan(original, before)
+        if new is None:
+            return
         try:
-            parsed = tomllib.loads(new)
+            after = tomllib.loads(new)
         except tomllib.TOMLDecodeError:
-            parsed = None
-        expected = copy.deepcopy(old)
-        expected.setdefault("profile", {})["active"] = name
-        if parsed != expected:
-            # e.g. a "[profile]" line inside a multi-line string: the line edit
+            after = None
+        expected = copy.deepcopy(before)
+        expected.setdefault(section, {})[key] = value
+        if after != expected:
+            # e.g. a "[section]" line inside a multi-line string: the line edit
             # would change something else. Don't guess - leave the file alone.
-            raise ValueError(f'couldn\'t safely update [profile] active in {path}; set it to "{name}" by hand')
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(new, encoding="utf-8", newline="")
-        os.replace(tmp, path)
-        _cache = None
+            raise ValueError(f"couldn't safely update [{section}] {key} in {path}; {fallback}")
+        if _read_config_text(path) != original:
+            raise ValueError(f"{path} changed while Argus was editing it (saved in an editor?); nothing was written, "
+                             "try again")
+        _atomic_write(path, new)
+        with _lock:
+            _cache = None
 
 
-WORK_LIST_KEYS = {"allow_apps", "allow_browser_titles", "allow_titles"}
+def _section_bounds(lines: list[str], name: str) -> tuple[int | None, int]:
+    """(index of the ``[name]`` header line, index just past its last line);
+    ``(None, len(lines))`` when the section isn't there."""
+    header = next((i for i, line in enumerate(lines)
+                   if (m := _SECTION.match(line)) and m.group(1).strip() == name), None)
+    if header is None:
+        return None, len(lines)
+    end = next((i for i in range(header + 1, len(lines)) if _SECTION.match(lines[i])), len(lines))
+    return header, end
+
+
+def _with_new_section(text: str, name: str, line: str, eol: str) -> str:
+    sep = "" if not text or text.endswith("\n") else eol
+    return f"{text}{sep}{eol}[{name}]{eol}{line}{eol}"
+
+
+WORK_LIST_KEYS = ("allow_apps", "allow_browser_titles", "allow_titles")
+
+
+def _check_work_key(key: str) -> None:
+    if key not in WORK_LIST_KEYS:
+        raise ValueError(f"unknown work list {key!r}")
+
+
+def _fold(key: str):
+    """How entries of a work list compare: exe names ignore case, regexes don't."""
+    return str.lower if key == "allow_apps" else str
+
+
+def _clean_work_values(key: str, values) -> list[str]:
+    """*values* deduplicated (first spelling wins) and validated."""
+    fold, seen, out = _fold(key), set(), []
+    for value in (str(v) for v in values):
+        if fold(value) not in seen:
+            seen.add(fold(value))
+            out.append(value)
+    if key == "allow_apps":
+        if any(not v.lower().endswith(".exe") for v in out):
+            raise ValueError("app names must end with .exe")
+    else:
+        for value in out:
+            try:
+                re.compile(value, re.IGNORECASE)
+            except re.error as exc:
+                raise ValueError(f"invalid regex {value!r}: {exc}") from None
+    return out
+
+
+def raw_work_lists() -> dict[str, list[str] | None]:
+    """The [work] lists exactly as config.toml spells them (casing and order kept,
+    unlike Settings). A list is None when the file can't be read or parsed, or
+    the value isn't a list of strings."""
+    settings()  # writes the default file if there is none
+    try:
+        doc = tomllib.loads(_read_config_text(config_path()))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return dict.fromkeys(WORK_LIST_KEYS)
+    work = doc.get("work", {})
+    out: dict[str, list[str] | None] = {}
+    for key in WORK_LIST_KEYS:
+        value = work.get(key, []) if isinstance(work, dict) else None
+        out[key] = value if _type_ok(value, STRS) else None
+    return out
 
 
 def set_work_list(key: str, values) -> Settings:
-    """Atomically replace one [work] array while preserving all other TOML text."""
-    global _cache
-    if key not in WORK_LIST_KEYS:
-        raise ValueError(f"unknown work list {key!r}")
-    values = list(dict.fromkeys(str(v) for v in values))
-    if key == "allow_apps":
-        if any(not v.lower().endswith(".exe") for v in values):
-            raise ValueError("app names must end with .exe")
-        values = list({v.lower(): v for v in values}.values())
-    else:
-        for value in values:
-            try:
-                re.compile(value)
-            except re.error as exc:
-                raise ValueError(f"invalid regex {value!r}: {exc}") from None
-    settings()
-    path = config_path()
-    with _lock:
-        with open(path, encoding="utf-8", newline="") as f:
-            original = f.read()
-        new = _with_work_list(original, key, values)
-        try:
-            before, parsed = tomllib.loads(original), tomllib.loads(new)
-            result = Settings.from_toml(new)
-        except tomllib.TOMLDecodeError as exc:
-            raise ValueError(f"{path} isn't valid TOML ({exc}); fix it first") from None
-        # Nothing but [work] <key> may change.
-        for doc in (before, parsed):
-            doc.get("work", {}).pop(key, None)
-            if doc.get("work") == {}:
-                doc.pop("work")
-        if before != parsed:
-            raise ValueError(f"editing [work] {key} would change other settings in {path}; edit it by hand")
-        expected = {"allow_apps": result.allow_apps,
-                    "allow_browser_titles": tuple(p.pattern for p in result.allow_browser_titles),
-                    "allow_titles": tuple(p.pattern for p in result.allow_titles)}[key]
-        expected_values = frozenset(v.lower() for v in values) if key == "allow_apps" else tuple(values)
-        if expected != expected_values:
-            raise ValueError(f"couldn't verify [work] {key} in {path}")
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(new, encoding="utf-8", newline="")
-        os.replace(tmp, path)
-        _cache = None
+    """Replace one [work] array, keeping all other text in config.toml."""
+    _check_work_key(key)
+    values = _clean_work_values(key, values)
+    settings()  # writes the default file if there is none
+    _edit_config("work", key, lambda text, _doc: (values, _with_work_list(text, key, values)),
+                 fallback=f"edit [work] {key} by hand")
     return settings()
 
 
+def edit_work_list(key: str, add=(), remove=()) -> tuple[list[str], list[str]]:
+    """Add and remove entries of one [work] array as deltas against what
+    config.toml says at that moment (read under the config lock), keeping the
+    user's spelling and order. Exe names match in any case, regexes exactly.
+    Refuses (ConfigProblems) while config.toml has any problem, since what
+    Argus would build on may not be what the user meant. Returns the list
+    before and after."""
+    _check_work_key(key)
+    add = _clean_work_values(key, add)
+    fold = _fold(key)
+    gone = {fold(str(v)) for v in remove}
+    settings()  # writes the default file if there is none
+    result: dict[str, list[str]] = {}
+
+    def plan(text: str, doc: dict):
+        s = Settings.from_toml(text, sticky_work=read_profile_state() == "work")
+        if s.problems:
+            raise ConfigProblems(s.problems)
+        current = list(doc.get("work", {}).get(key, []))
+        values = [v for v in current if fold(v) not in gone]
+        have = {fold(v) for v in values}
+        values.extend(v for v in add if fold(v) not in have)
+        result.update(before=current, after=values)
+        return values, (None if values == current else _with_work_list(text, key, values))
+
+    _edit_config("work", key, plan, fallback=f"edit [work] {key} by hand")
+    return result["before"], result["after"]
+
+
+def _array_end(lines: list[str], start: int, column: int, end: int) -> tuple[tuple[int, int], list[str]]:
+    """Where the TOML array opened at lines[start][column - 1] closes, as (line,
+    column just past the "]"), and the comments inside it. Quoted strings are
+    skipped, so brackets and "#" inside them don't count."""
+    depth, quote, escaped = 1, None, False
+    comments = []
+    for j in range(start, end):
+        row = lines[j].rstrip("\r\n")
+        for k in range(column if j == start else 0, len(row)):
+            ch = row[k]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif ch == "\\" and quote == '"':
+                    escaped = True
+                elif ch == quote:
+                    quote = None
+            elif ch == "#":
+                comments.append(row[k:])
+                break
+            elif ch in "\"'":
+                quote = ch
+            elif ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    return (j, k + 1), comments
+    raise ValueError("unterminated array")
+
+
 def _with_work_list(text: str, key: str, values: list[str]) -> str:
+    """*text* with ``[work] key`` set to *values*; nothing else changes."""
     lines = text.splitlines(keepends=True)
-    newline = "\r\n" if "\r\n" in text else "\n"
-    header = next((i for i, line in enumerate(lines) if (m := _SECTION.match(line)) and m.group(1).strip() == "work"), None)
+    eol = "\r\n" if "\r\n" in text else "\n"
     encoded = "[" + ", ".join(json.dumps(v, ensure_ascii=False) for v in values) + "]"
+    header, end = _section_bounds(lines, "work")
     if header is None:
-        sep = "" if not text or text.endswith("\n") else newline
-        return f"{text}{sep}{newline}[work]{newline}{key} = {encoded}{newline}"
-    end = next((i for i in range(header + 1, len(lines)) if _SECTION.match(lines[i])), len(lines))
+        return _with_new_section(text, "work", f"{key} = {encoded}", eol)
     matcher = re.compile(rf"^(\s*{re.escape(key)}\s*=\s*)(\[)")
     for i in range(header + 1, end):
         body = lines[i].rstrip("\r\n")
         match = matcher.match(body)
         if not match:
             continue
-        # Arrays may span lines. Locate the matching bracket while respecting quoted strings.
-        depth, quote, escaped, finish = 1, None, False, None
-        comments = []  # comments inside the array, found outside quoted strings
-        for j in range(i, end):
-            row = lines[j].rstrip("\r\n")
-            start = match.end(2) if j == i else 0
-            for k in range(start, len(row)):
-                ch = row[k]
-                if quote:
-                    if escaped: escaped = False
-                    elif ch == "\\" and quote == '"': escaped = True
-                    elif ch == quote: quote = None
-                elif ch == "#":
-                    comments.append(row[k:])
-                    break
-                elif ch in "\"'": quote = ch
-                elif ch == "[": depth += 1
-                elif ch == "]":
-                    depth -= 1
-                    if depth == 0:
-                        finish = (j, k + 1)
-                        break
-            if finish: break
-        if not finish: raise ValueError(f"unterminated [work] {key} array")
-        j, k = finish
-        suffix = lines[j].rstrip("\r\n")[k:]
-        replacement = [body[:match.start(2)] + encoded + suffix + (lines[j][len(lines[j].rstrip("\r\n")):])]
-        replacement.extend(f"# {comment.lstrip('# ').rstrip()}{newline}" for comment in comments)
+        try:
+            (j, k), comments = _array_end(lines, i, match.end(2), end)
+        except ValueError:
+            raise ValueError(f"unterminated [work] {key} array") from None
+        row = lines[j].rstrip("\r\n")
+        replacement = [body[:match.start(2)] + encoded + row[k:] + lines[j][len(row):]]
+        replacement.extend(f"# {comment.lstrip('# ').rstrip()}{eol}" for comment in comments)
         lines[i:j + 1] = replacement
         return "".join(lines)
-    if end > header + 1 and not lines[end - 1].endswith("\n"):
-        lines[end - 1] += newline
-    lines.insert(end, f"{key} = {encoded}{newline}")
+    if not lines[end - 1].endswith("\n"):
+        lines[end - 1] += eol
+    lines.insert(end, f"{key} = {encoded}{eol}")
     return "".join(lines)
 
 
@@ -660,13 +846,10 @@ def _with_profile(text: str, name: str) -> str:
     """*text* with ``[profile] active`` set to *name*; nothing else changes."""
     lines = text.splitlines(keepends=True)
     eol = "\r\n" if "\r\n" in text else "\n"  # the file's own line ending
-    header = next((i for i, line in enumerate(lines) if (m := _SECTION.match(line)) and m.group(1).strip() == "profile"), None)
+    header, end = _section_bounds(lines, "profile")
     if header is None:
-        sep = "" if not text or text.endswith("\n") else eol
-        return f'{text}{sep}{eol}[profile]{eol}active = "{name}"{eol}'
-    for i in range(header + 1, len(lines)):
-        if _SECTION.match(lines[i]):
-            break
+        return _with_new_section(text, "profile", f'active = "{name}"', eol)
+    for i in range(header + 1, end):
         body = lines[i].rstrip("\r\n")
         m = _ACTIVE.match(body)
         if m:
