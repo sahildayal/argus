@@ -280,8 +280,16 @@ def log_decision(
             year_delta, next_month = divmod(month, 12)
             target_file = base / f"audit-{year + year_delta:04d}-{next_month + 1:02d}.jsonl"
         prev, recovered = _find_prev_hash(files, anchor)
-        head = _load_head(base)
-        count = head["count"] if head and head["hash"] == prev else _entries_since_head(files, anchor, head)
+        tail_missing = False
+        try:
+            head = _load_head(base)
+            count = head["count"] if head and head["hash"] == prev else _entries_since_head(files, anchor, head)
+        except (OSError, ValueError):
+            # head.json is unreadable or names a line that's gone (restored backup,
+            # sync conflict, deleted month). Keep logging: chain on from what's on
+            # disk and mark this entry so `argus audit verify` reports the gap.
+            tail_missing = True
+            count = _entries_since_head(files, anchor, None)
         record = {
             "ts": _utc_stamp(now_utc),
             "profile": profile,
@@ -299,6 +307,8 @@ def log_decision(
         }
         if recovered:
             record["recovered"] = True
+        if tail_missing:
+            record["tail_missing"] = True
         line_hash = _append_record(target_file, record)
         _write_head(base, {"hash": line_hash, "count": count + 1, "ts": record["ts"]})
 
@@ -363,6 +373,7 @@ def _verify_locked(base: Path) -> tuple[bool, str]:
     notices = [f"Audit logs pruned through {anchor['pruned_through']}."] if anchor else []
     invalid_at = None
     total_entries = 0
+    gaps: list[str] = []  # entries written after head.json showed lost entries
 
     for path in files:
         with path.open("rb") as f:
@@ -384,6 +395,8 @@ def _verify_locked(base: Path) -> tuple[bool, str]:
                 if data.get("prev") != expected_prev:
                     expected = "genesis prev" if expected_prev == "genesis" else f"prev {expected_prev}"
                     return False, "\n".join([f"Chain broken at {where} (expected {expected}).", *notices])
+                if data.get("tail_missing") is True:
+                    gaps.append(where)
                 expected_prev = hashlib.sha256(line).hexdigest()
                 total_entries += 1
 
@@ -392,6 +405,9 @@ def _verify_locked(base: Path) -> tuple[bool, str]:
     head = _load_head(base)
     if head is not None and head["hash"] != expected_prev:
         return False, "\n".join([_TAIL_MISSING, *notices])
+    if gaps:
+        lost = f"{_TAIL_MISSING} Entries were lost before {', '.join(gaps)}; logging resumed there."
+        return False, "\n".join([lost, *notices])
     if not files:
         summary = "No audit logs found."
     elif not total_entries:

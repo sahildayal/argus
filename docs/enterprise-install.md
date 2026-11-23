@@ -346,7 +346,7 @@ Outside that folder:
 - a named mutex `Local\ArgusTray` while the tray runs (single instance). With `ARGUS_HOME`
   set to another folder the name is `Local\ArgusTray-<SHA-256 of that folder's path>`, so
   trays for different data folders don't block each other;
-- a per-user named pipe `\\.\pipe\ArgusApproval-v2-<SHA-256 of user SID, session and data
+- a per-user named pipe `\\.\pipe\ArgusApproval-v3-<SHA-256 of user SID, session and data
   folder>` while the tray runs, which carries approval previews from `argus-mcp` and the CLI
   to the tray (see below).
 

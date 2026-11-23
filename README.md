@@ -427,11 +427,18 @@ For a workplace where screens can show patient or other regulated data:
    `Read`/`Edit` rules use gitignore-style paths (`~/` is your home folder);
    `Bash(argus *)` blocks commands that start with `argus`. Bash rules match
    command text, not intent, so they are a guard rail, not a sandbox: a command
-   written another way can still run. That's why the work profile also routes
-   CLI captures through the tray approval and the audit log, and refuses to
-   reopen files outside `~/.argus`. Other AI tools have similar permission
-   settings; check their documentation.
-5. Check the log now and then with `argus audit` and `argus audit verify`.
+   written another way can still run. On Windows, Claude Code can also run
+   commands through its PowerShell tool, which `Bash(...)` rules don't cover:
+   add matching rules for it too (for example `PowerShell(argus *)` - check the
+   Claude Code permissions docs for the exact syntax in your version). That's
+   why the work profile also routes CLI captures through the tray approval and
+   the audit log, and refuses to reopen files outside `~/.argus`. Other AI tools
+   have similar permission settings; check their documentation.
+5. Check the log now and then with `argus audit` and `argus audit verify`. If
+   `audit/head.json` is lost or out of step with the log (a restored backup or a
+   sync conflict), Argus keeps logging, marks the next entry, and `verify`
+   reports where entries went missing. To start a clean chain, archive the
+   `audit` folder and let Argus create a new one.
 
 What changes in the work profile, in short:
 
@@ -440,8 +447,9 @@ What changes in the work profile, in short:
 - Every share is previewed in the tray; `zoom`, `read_text` and `find_text`
   always ask again, showing the exact crop or text.
 - Captures are written to disk only after approval; denied or timed-out ones
-  are never saved. Baselines are saved only when you (or the AI) explicitly
-  save one.
+  are never saved. Baselines are the exception: `save_baseline` writes a
+  redacted capture to `baselines/` without a prompt (it returns only a receipt,
+  no image), because saving one is an explicit request.
 - CLI capture commands go through the same approval and audit log as MCP.
 - Only Argus capture ids and files inside `~/.argus/captures`, `marks` or
   `baselines` can be reopened.

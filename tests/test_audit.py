@@ -627,8 +627,10 @@ def test_head_detects_loss_of_whole_records(remove_whole_file):
     else:
         path.write_bytes(first + b"\n")
     assert audit.verify_chain() == (False, "Audit tail missing/truncated.")
-    with pytest.raises(ValueError, match="tail missing/truncated"):
-        audit.log_decision(_decision())
+    # Logging continues (captures aren't blocked forever) and the gap stays visible.
+    assert audit.log_decision(_decision())["tail_missing"] is True
+    ok, message = audit.verify_chain()
+    assert not ok and "tail missing/truncated" in message
 
 
 def test_append_recovers_when_head_replace_was_interrupted(monkeypatch):
@@ -675,3 +677,19 @@ def test_images_and_hashes_only_include_sent_bytes():
     assert denied["image_sha256"] == intermediate["image_sha256"] == []
     assert sent["images"] == 1 and sent["image_sha256"] == [hashlib.sha256(b"valid").hexdigest()]
 
+
+
+def test_lost_head_checkpoint_keeps_logging_and_verify_reports_the_gap(tmp_path):
+    from argus import audit
+    from argus.gate import Decision
+
+    def decide(i):
+        return Decision(True, "user", "screenshot", ["Code.exe"], 0.0, f"{i:032x}")
+
+    audit.log_decision(decide(1), dir_path=tmp_path)
+    audit.log_decision(decide(2), dir_path=tmp_path)
+    (tmp_path / "head.json").write_text('{"hash": "' + "0" * 64 + '", "count": 9, "ts": "2026-01-01T00:00:00Z"}\n')
+    record = audit.log_decision(decide(3), dir_path=tmp_path)  # must not raise
+    assert record["tail_missing"] is True
+    ok, message = audit.verify_chain(tmp_path)
+    assert not ok and "lost before" in message

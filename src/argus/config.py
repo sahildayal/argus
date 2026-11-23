@@ -688,6 +688,14 @@ def _atomic_write(path: Path, text: str) -> None:
 
 
 def _edit_config(section: str, key: str, plan, *, fallback: str) -> None:
+    try:
+        _edit_config_locked(section, key, plan, fallback=fallback)
+    except OSError as exc:
+        # Lock or atomic-replace failures reach the tray/CLI as a readable error.
+        raise ValueError(f"couldn't update {config_path().name} ({type(exc).__name__}); try again") from None
+
+
+def _edit_config_locked(section: str, key: str, plan, *, fallback: str) -> None:
     """Set ``[section] key`` in config.toml by a text edit that keeps the user's
     comments and layout. ``plan(text, parsed)`` returns ``(value, new_text)``
     (``new_text`` None: nothing to change). Under the config lock, the edit is

@@ -80,7 +80,8 @@ def _disclose(
         query=result.query, allow_trust=allow_trust and can_trust and tool != "list_screens",
         client=_client_name.get(),
     ))
-    publish_captures(caps if start.enabled else None)
+    # Separator tools preview text only, so none of their captures were reviewed.
+    publish_captures(([] if separator is not None else caps) if start.enabled else None)
     if result.query:
         request_text = f"{gate.QUERY_LABEL}: {result.query}"
         out = [request_text, *out] if isinstance(out, list) else f"{request_text}\n\n{out}"

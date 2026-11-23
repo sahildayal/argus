@@ -290,10 +290,11 @@ def _capture_cmd(args, start: gate.Policy, tool: str) -> int | None:
 
     cmd = args.cmd
     work = start.profile == "work"
+    gated = start.enabled  # work always; personal with [gate] enabled = true, as for MCP
     session = Session(track=False, defer_marks=True)
 
     def review(text, shots=(), *, result=None, required=True):
-        if work or gate.policy_changed(start):
+        if gated or gate.policy_changed(start):
             windows, _ = result.approval_scope() if result is not None else (None, False)
             previews = []
             for shot in shots:
@@ -306,7 +307,7 @@ def _capture_cmd(args, start: gate.Policy, tool: str) -> int | None:
                 allow_trust=False, client="argus-cli",
             ))
         if result is not None:
-            publish_captures(result.captures if work else None)
+            publish_captures(result.captures if gated else None)
 
     def emit(result, out=None):
         review(_result_text(result, args), (cap.shot for cap in result.captures), result=result)
@@ -369,7 +370,7 @@ def _capture_cmd(args, start: gate.Policy, tool: str) -> int | None:
         watch = WatchApproval(start, query, client="argus-cli", allow_trust=False)
         result = asyncio.run(session.wait_for(
             args.until, args.text, args.monitor, args.window, args.region, args.timeout,
-            approve_frame=watch.review_frame if work else None,
+            approve_frame=watch.review_frame if gated else None,
         ))
         emit(result)
         first = next((p for p in result.parts if isinstance(p, str)), "")
