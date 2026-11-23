@@ -114,6 +114,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("cleanup", help="delete captures older than the retention period")
     p.add_argument("--all", action="store_true", help="delete every saved capture and mark now")
 
+    p = sub.add_parser("audit", help="gate decision audit log")
+    p.add_argument("--since", help="filter entries since ISO date (YYYY-MM-DD)")
+    p.add_argument("-n", "--count", type=int, default=20, help="max entries to show (default 20)")
+    asub = p.add_subparsers(dest="audit_action", required=False)
+    asub.add_parser("verify", help="verify tamper-evidence hash chain")
+    e = asub.add_parser("export", help="copy audit log to a file for compliance")
+    e.add_argument("-o", "--out", type=Path, required=True, help="output .jsonl file")
+    e.add_argument("--since", help="filter entries since ISO date (YYYY-MM-DD)")
+
     sub.add_parser("tray", help="run the tray app (hotkeys) in this console")
     sub.add_parser("mcp", help="run the MCP server on stdio")
 
@@ -199,6 +208,8 @@ def _run(args) -> int | None:
         return getattr(install, cmd)(args)
     if cmd in ("pause", "resume", "status", "cleanup"):
         return _privacy_cmd(args)
+    if cmd == "audit":
+        return _audit_cmd(args)
     if cmd == "profile":
         return _profile_cmd(args)
     if cmd == "allow":
@@ -282,6 +293,32 @@ def _baseline(session, args) -> int:
     elif args.action == "delete":
         print("Deleted." if testing.delete_baseline(args.name) else f"No baseline named {args.name!r}.")
     return 0
+
+
+def _audit_cmd(args) -> int:
+    from . import audit
+
+    action = getattr(args, "audit_action", None)
+    if action == "verify":
+        valid, msg = audit.verify_chain()
+        if valid:
+            print(msg)
+            return 0
+        else:
+            print(f"argus audit: {msg}", file=sys.stderr)
+            return 1
+    elif action == "export":
+        since = getattr(args, "since", None)
+        out = args.out
+        count = audit.export_log(out, since=since)
+        print(f"Exported {count} audit entry(ies) to {out}")
+        return 0
+    else:
+        since = getattr(args, "since", None)
+        count = getattr(args, "count", 20)
+        entries = audit.read_entries(since=since, limit=None if since else count)
+        print(audit.format_table(entries))
+        return 0
 
 
 def _privacy_cmd(args) -> int:

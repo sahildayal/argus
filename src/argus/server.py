@@ -30,6 +30,11 @@ from .service import Result, Session, caption
 log = logging.getLogger("argus")
 _session: Session | None = None
 _policy: ContextVar[gate.Policy] = ContextVar("argus_approval_policy")
+_client_name: ContextVar[str | None] = ContextVar("argus_client_name", default=None)
+
+
+def current_client() -> str | None:
+    return _client_name.get()
 
 
 def session() -> Session:
@@ -82,6 +87,7 @@ def _disclose(
     gate.require(gate.request(
         tool, images, text, windows=windows, start=start, required=result.screen_derived,
         previously_approved=derived, allow_trust=allow_trust and tool != "list_screens",
+        client=_client_name.get(),
     ))
     if start.enabled and separator is None:
         for cap in caps:
@@ -100,7 +106,7 @@ def _errors(fn):
             return exc
         if isinstance(exc, ArgusError):
             if start is not None and not isinstance(exc, Paused):
-                gate.require(gate.request(fn.__name__, text=(str(exc),), start=start, allow_trust=False))
+                gate.require(gate.request(fn.__name__, text=(str(exc),), start=start, allow_trust=False, client=_client_name.get()))
             return ToolError(str(exc))
         log.exception("tool %s failed", fn.__name__)
         if start is None or start.enabled:
@@ -110,6 +116,8 @@ def _errors(fn):
     def stopped(exc: gate.GateStopped) -> str:
         if str(exc) == gate.UNAVAILABLE:
             raise ToolError(gate.UNAVAILABLE) from None
+        if str(exc) == gate.AUDIT_FAILED:
+            raise ToolError(gate.AUDIT_FAILED) from None
         return gate.DECLINED
 
     if inspect.iscoroutinefunction(fn):
@@ -170,6 +178,65 @@ def _instructions() -> str:
 
 
 mcp = MCPServer("argus", title="Argus", version=__version__, instructions=_instructions())
+
+
+def _extract_client_name(ctx_or_session) -> str | None:
+    try:
+        session = getattr(ctx_or_session, "session", ctx_or_session)
+        client_params = getattr(session, "client_params", None)
+        client_info = getattr(client_params, "clientInfo", None)
+        if client_info and getattr(client_info, "name", None):
+            return str(client_info.name)
+    except Exception:
+        pass
+    return None
+
+
+orig_call_tool = mcp.call_tool
+
+
+async def _call_tool_with_client(name, arguments, context=None):
+    client_name = _extract_client_name(context)
+    token = _client_name.set(client_name)
+    try:
+        from . import audit
+        audit.set_current_client(client_name)
+    except Exception:
+        pass
+    try:
+        return await orig_call_tool(name, arguments, context)
+    finally:
+        _client_name.reset(token)
+        try:
+            from . import audit
+            audit.set_current_client(None)
+        except Exception:
+            pass
+
+
+mcp.call_tool = _call_tool_with_client
+
+
+async def _track_client_middleware(ctx, call_next):
+    client_name = _extract_client_name(ctx)
+    token = _client_name.set(client_name)
+    try:
+        from . import audit
+        audit.set_current_client(client_name)
+    except Exception:
+        pass
+    try:
+        return await call_next(ctx)
+    finally:
+        _client_name.reset(token)
+        try:
+            from . import audit
+            audit.set_current_client(None)
+        except Exception:
+            pass
+
+
+mcp._lowlevel_server.middleware.append(_track_client_middleware)
 
 RO = ToolAnnotations(read_only_hint=True, open_world_hint=False)
 WRITES = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
@@ -340,7 +407,7 @@ async def wait_for(
             view, _ = render(previous.image, max_side=settings().max_side)
             gate.require(gate.request(
                 "wait_for", (view.data,), windows=previous.share_windows, start=start,
-                watching=True, allow_trust=not changed,
+                watching=True, allow_trust=not changed, client=_client_name.get(),
             ))
             changed = True
         previous = shot

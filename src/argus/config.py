@@ -31,6 +31,11 @@ active = "personal"
 timeout_seconds = 30
 trust_minutes = 10
 
+[audit]
+# Audit logging is on in work, off in personal. Uncomment to opt in for personal too.
+# enabled = true
+retention_months = 12
+
 [capture]
 # Longest side (px) of images sent to the AI. 2000 keeps long sessions with
 # many screenshots inside the API's multi-image limit, and lets a 1080p
@@ -150,6 +155,8 @@ class Settings:
     gate_enabled: bool = False  # personal opt-in; work always requires approval
     gate_timeout_seconds: float = 30.0
     gate_trust_minutes: float = 10.0
+    audit_enabled: bool = False  # personal opt-in; work always logs audit
+    audit_retention_months: int = 12
     problems: tuple[str, ...] = field(default=())
 
     @property
@@ -159,6 +166,10 @@ class Settings:
     @property
     def requires_approval(self) -> bool:
         return self.work or self.gate_enabled
+
+    @property
+    def requires_audit(self) -> bool:
+        return self.audit_enabled
 
     @classmethod
     def from_toml(cls, text: str) -> Settings:
@@ -182,6 +193,11 @@ class Settings:
             problems.append("gate: expected a table; using the defaults")
             gate = {}
 
+        audit = data.get("audit", {})
+        if not isinstance(audit, dict):
+            problems.append("audit: expected a table; using the defaults")
+            audit = {}
+
         def get(section: str, key: str):
             return data.get(section, {}).get(key, defaults[section][key])
 
@@ -201,10 +217,27 @@ class Settings:
             problems.append(f"gate.{key}: expected a positive number up to 86400; using the default")
             return float(defaults["gate"][key])
 
+        def audit_retention() -> int:
+            val = audit.get("retention_months", defaults.get("audit", {}).get("retention_months", 12))
+            if isinstance(val, int) and val > 0:
+                return val
+            problems.append("audit.retention_months: expected a positive integer; using the default")
+            return 12
+
         profile = str(get("profile", "active")).strip().lower()
         if profile not in PROFILES:
             problems.append(f'profile.active: unknown profile {profile!r} (use "personal" or "work"); using "work" to be safe')
             profile = "work"
+
+        audit_explicit = audit.get("enabled")
+        if audit_explicit is not None and not isinstance(audit_explicit, bool):
+            problems.append("audit.enabled: expected a boolean; using the default")
+            audit_explicit = None
+
+        if audit_explicit is not None:
+            audit_enabled = audit_explicit
+        else:
+            audit_enabled = (profile == "work")
 
         return cls(
             max_side=max(256, int(get("capture", "max_side"))),
@@ -228,6 +261,8 @@ class Settings:
             gate_enabled=gate.get("enabled") is True,
             gate_timeout_seconds=gate_duration("timeout_seconds"),
             gate_trust_minutes=gate_duration("trust_minutes"),
+            audit_enabled=audit_enabled,
+            audit_retention_months=audit_retention(),
             problems=tuple(problems),
         )
 
