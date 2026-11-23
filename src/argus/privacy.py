@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from PIL import Image, ImageDraw
 
 from .config import Settings, home
-from .desktop import Desktop, Paused, Window
+from .desktop import _SHELL_CLASSES, _SHELL_PROCESSES, ArgusError, Desktop, Paused, Window
 from .geometry import Rect
 from .imaging import load_font
 
@@ -95,13 +95,149 @@ def sensitive_reason(w: Window, s: Settings) -> str | None:
     return None
 
 
+# ------------------------------------------------------------- work profile
+
+
+def allowed(w: Window, s: Settings) -> bool:
+    """May this window be seen at all? Always True in the personal profile; in
+    the work profile only windows on the [work] allow lists are (the block list
+    still applies on top - see `shown`). Shell surfaces (desktop, taskbar,
+    notifications, Start) and windows of unknown programs never are."""
+    if not s.work:
+        return True
+    process = w.process.lower()
+    if not process or not w.pid or w.cls in _SHELL_CLASSES or process in _SHELL_PROCESSES:
+        return False
+    if process in s.allow_apps:
+        return True
+    if process in s.browsers and any(p.search(w.title) for p in s.allow_browser_titles):
+        return True
+    return any(p.search(w.title) for p in s.allow_titles)
+
+
+def shown(w: Window, s: Settings) -> bool:
+    """Allowed and not on the block list: its pixels and title may leave Argus."""
+    return allowed(w, s) and sensitive_reason(w, s) is None
+
+
+def display_name(w: Window, s: Settings) -> str:
+    """How Argus names a window to the AI (lists, captions, errors, logs). The
+    title is left out whenever the window is hidden by either profile."""
+    if not allowed(w, s):
+        return f"{w.app or w.process or 'unknown app'} (hidden, work profile)"
+    if sensitive_reason(w, s):
+        return f"{w.app or w.process} (title hidden, privacy list)"
+    return w.label
+
+
+def check_window(w: Window, s: Settings) -> None:
+    """Refuse to target a window the work profile doesn't allow."""
+    if not allowed(w, s):
+        raise ArgusError(
+            f"{display_name(w, s)} isn't allowed by the user's work profile, so Argus won't capture it or share its "
+            "title. Tell the user; only they can allow an app (under [work] in ~/.argus/config.toml). "
+            "Don't try to work around it."
+        )
+
+
+WORK_HIDDEN = "everything outside the allowed apps (work profile)"
+WORK_LABEL = "Hidden by Argus: work profile"
+
+
+def _root_owner(desk: Desktop, w: Window) -> Window | None:
+    """The top of *w*'s visible owner chain, or None if it has no visible owner."""
+    cur, seen = w, set()
+    while cur.owner and cur.owner not in seen:
+        seen.add(cur.owner)
+        nxt = desk.window(cur.owner)
+        if nxt is None:
+            break
+        cur = nxt
+    return None if cur is w else cur
+
+
+def shown_windows(desk: Desktop, s: Settings) -> set[int]:
+    """Handles of the windows whose pixels the work profile reveals: allowed,
+    unblocked windows, plus their own menus/popups floating in front of them."""
+    live = [w for w in desk.layers if not w.minimized and not w.see_through]
+    tops = {w.hwnd: w for w in live if shown(w, s)}
+    out = set(tops)
+    # Processes that also own a hidden window (every Chrome window shares one
+    # process): their unowned popups can't be attributed safely.
+    hidden_pids = {w.pid for w in live if w.is_app and w.hwnd not in tops}
+    for p in live:
+        if p.hwnd in out or p.is_app or not p.pid or p.cls in _SHELL_CLASSES or sensitive_reason(p, s):
+            continue
+        owner = _root_owner(desk, p)
+        if owner is not None:
+            if owner.hwnd in tops and p.z < owner.z:
+                out.add(p.hwnd)
+        elif p.pid not in hidden_pids and any(
+            t.pid == p.pid and p.z < t.z and t.rect.intersect(p.rect) for t in tops.values()
+        ):
+            out.add(p.hwnd)
+    return out
+
+
+def _redact_work(img: Image.Image, region: Rect, desk: Desktop, s: Settings) -> list[str]:
+    """Allow-list redaction, failing closed: start fully hidden and paint windows
+    back to front, revealing the shown ones and re-hiding whatever covers them.
+    Wallpaper, taskbar and any area no window covers stay hidden."""
+    reveal = shown_windows(desk, s)
+    mask = Image.new("L", img.size, 255)  # 255 = hidden
+    draw = ImageDraw.Draw(mask)
+
+    def local(r: Rect) -> list[int]:
+        return [r.x - region.x, r.y - region.y, r.right - region.x - 1, r.bottom - region.y - 1]
+
+    blocked: set[str] = set()
+    for w in reversed(desk.layers):
+        if w.minimized or w.see_through:
+            continue
+        inter = w.rect.intersect(region)
+        if not inter:
+            continue
+        draw.rectangle(local(inter), fill=0 if w.hwnd in reveal else 255)
+        if allowed(w, s) and (reason := sensitive_reason(w, s)):
+            blocked.add(reason)
+    if not mask.getbbox():
+        return []
+    img.paste(SHADE, mask=mask)
+
+    # One label per big, (nearly) solid hidden block - not one per sliver.
+    candidates = [w.rect for w in desk.layers if not w.minimized and not w.see_through and w.hwnd not in reveal]
+    candidates += [m.rect for m in desk.monitors] + [region]
+    placed: list[tuple[int, int, int, int]] = []
+    for r in sorted(candidates, key=lambda r: -r.area):
+        inter = r.intersect(region)
+        if not inter or inter.w < 300 or inter.h < 120:
+            continue
+        box = (inter.x - region.x, inter.y - region.y, inter.right - region.x, inter.bottom - region.y)
+        if any(box[0] < b[2] and b[0] < box[2] and box[1] < b[3] and b[1] < box[3] for b in placed):
+            continue
+        if mask.crop(box).histogram()[255] < 0.9 * inter.area:
+            continue
+        if mask.getpixel(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)) != 255:
+            continue
+        _label(img, box, WORK_LABEL)
+        placed.append(box)
+        if len(placed) >= 8:
+            break
+    return [WORK_HIDDEN, *sorted(blocked)]
+
+
+# ---------------------------------------------------------------- block list
+
 SHADE = (24, 24, 27)
 
 
 def redact(img: Image.Image, origin: tuple[int, int], desk: Desktop, s: Settings) -> list[str]:
     """Black out every sensitive window visible in *img* (which shows the desktop
-    area starting at *origin*). Returns the reasons, one per window hidden."""
+    area starting at *origin*). Returns the reasons, one per window hidden. In
+    the work profile, everything but the allowed windows is blacked out instead."""
     region = Rect(origin[0], origin[1], img.width, img.height)
+    if s.work:
+        return _redact_work(img, region, desk, s)
     hidden: list[str] = []
     for w in desk.layers:
         if w.minimized or w.see_through:

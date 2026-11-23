@@ -72,6 +72,21 @@ def _looks_like_path(ref: str) -> bool:
     return any(c in ref for c in ":\\/") or ref.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".webp"))
 
 
+def _profile_ok(shot: Shot, s: Settings) -> bool:
+    """In the work profile, only images Argus redacted under the work profile may
+    be shown again (not captures, marks or baselines from the personal profile,
+    nor arbitrary image files)."""
+    return not s.work or shot.profile == "work"
+
+
+def _require_profile(shot: Shot, s: Settings) -> None:
+    if not _profile_ok(shot, s):
+        raise ArgusError(
+            "The user's work profile is on, and that image wasn't taken under it (it's from the personal profile, "
+            "or isn't an Argus capture), so Argus won't show it. Take a fresh capture instead."
+        )
+
+
 class Session:
     def __init__(self, host: Host | None = None, track: bool = True):
         self.host = host or detect_host()
@@ -122,9 +137,14 @@ class Session:
         return result
 
     def capture_ref(self, ref: str | None) -> Capture:
+        s = settings()
         if ref and _looks_like_path(ref):
-            return self.register(open_file(ref.strip().strip('"')), save=False)
-        return self.store.get(ref)
+            shot = open_file(ref.strip().strip('"'))
+            _require_profile(shot, s)
+            return self.register(shot, save=False)
+        cap = self.store.get(ref)
+        _require_profile(cap.shot, s)
+        return cap
 
     # -- look --------------------------------------------------------------------
 
@@ -137,7 +157,7 @@ class Session:
             mark = marks[0] if marks else None
             if mark and mark.id not in self.used_marks and time.time() - mark.when <= s.mark_freshness:
                 shot = mark.shot(scope)
-                if shot is not None:
+                if shot is not None and _profile_ok(shot, s):
                     self.used_marks.add(mark.id)
                     what = mark.info.get("monitor" if scope == "monitor" else "window") or mark.info.get("monitor")
                     result = Result().text(
@@ -147,17 +167,37 @@ class Session:
                     return self._show(result, [shot], grid)
 
         desk = self.desk()
-        choice = choose(desk, self.history())
+
+        def name(w: Window) -> str:
+            return privacy.display_name(w, s)
+
+        history = self.history()
+        choice = choose(desk, history, (lambda w: privacy.allowed(w, s)) if s.work else None)
         footer = []
+        notice = ""
+        if s.work:
+            likely = choose(desk, history).window
+            if likely is not None and not privacy.allowed(likely, s):
+                notice = (
+                    f"The window the user was most likely looking at, {name(likely)}, isn't allowed by their work "
+                    "profile, so Argus won't show it."
+                )
         if choice.host is not None:
-            footer.append(f"Skipped {choice.host.label}: that's the window you're chatting with me in.")
+            footer.append(f"Skipped {name(choice.host)}: that's the window you're chatting with me in.")
         if choice.alternatives:
             alts = "; ".join(
-                f"{why}: {w.label}" + (f" on Monitor {w.monitor}" if w.monitor else "") + f" [{w.handle}]"
+                f"{why}: {name(w)}" + (f" on Monitor {w.monitor}" if w.monitor else "") + f" [{w.handle}]"
                 for why, w in choice.alternatives
             )
             footer.append(f"Other candidates - {alts}. If I picked the wrong one, use screenshot(window=\"<handle>\").")
 
+        if choice.window is None and s.work:
+            raise ArgusError(
+                " ".join(
+                    filter(None, [notice, "No window the work profile allows is open (other than this chat). Tell the "
+                                  "user; only they can allow apps (under [work] in ~/.argus/config.toml)."] + footer)
+                )
+            )
         if choice.window is None:
             mon = desk.cursor_monitor
             result = Result().text(f"No other app window is open, so here is the monitor the mouse is on ({mon.title}).")
@@ -168,14 +208,14 @@ class Session:
         if scope == "monitor":
             mon = desk.monitor(win.monitor) if win.monitor else desk.cursor_monitor
             shot = capture_monitor(desk, mon, s)
-            header = f"{mon.title}, the monitor showing {win.label}. Picked because {choice.reason}."
+            header = f"{mon.title}, the monitor showing {name(win)}. Picked because {choice.reason}."
         else:
             try:
                 shot = capture_window(desk, win, s)
             except ArgusError as exc:
                 raise ArgusError(f"{exc} {' '.join(footer)}") from None
-            header = f"Picked {win.label} because {choice.reason}."
-        result = Result().text(header)
+            header = f"Picked {name(win)} because {choice.reason}."
+        result = Result().text(notice, header)
         self._show(result, [shot], grid)
         return result.text(*footer)
 
@@ -229,6 +269,7 @@ class Session:
             monitor=cap.shot.monitor,
             window=cap.shot.window,
             taken=cap.shot.taken,
+            profile=cap.shot.profile,
         )
         return Result().add(self.register(shot, grid=grid, upscale_to=1200))
 
@@ -242,7 +283,12 @@ class Session:
             return Result().text(f"Argus {__version__}: {state.describe()} by the user. Nothing can be listed or captured until they resume it.")
         s = settings()
         desk = self.desk()
-        lines = [f"Argus {__version__}: captures {state.describe()}. You're chatting from: {host_label(desk)}."]
+        lines = [f"Argus {__version__}: captures {state.describe()}, {s.profile} profile. You're chatting from: {host_label(desk)}."]
+        if s.work:
+            lines.append(
+                "Work profile: only the apps the user allowed are visible. Everything else (other windows, the desktop, "
+                "the taskbar) is blacked out in captures, and hidden windows are listed without their titles."
+            )
         cm = desk.cursor_monitor
         lines.append(f"Mouse at ({desk.cursor[0]}, {desk.cursor[1]}), on {cm.title}.")
         lines.append("")
@@ -276,8 +322,7 @@ class Session:
 
     @staticmethod
     def _safe_label(w: Window, s: Settings) -> str:
-        reason = privacy.sensitive_reason(w, s)
-        return f"{w.app or w.process} (title hidden, privacy list)" if reason else w.label
+        return privacy.display_name(w, s)
 
     def _window_line(self, w: Window, desk: Desktop, s: Settings) -> str:
         tags = []
@@ -297,10 +342,19 @@ class Session:
     # -- the user's own captures -------------------------------------------------------
 
     def latest_snip(self, count: int = 1, grid: bool | None = None) -> Result:
-        self.guard()
+        s = self.guard()
         tr = self.tracker
-        snips = latest_snips(count, tr.clip_time if tr else None, tr.clip_seq if tr else None)
+        # Snips can't be redacted (Argus doesn't know what windows they show), so
+        # the work profile skips the Screenshots folder unless the user opted in.
+        # TODO(work-profile step 3): gate snips behind the user confirmation prompt.
+        files = not s.work or s.allow_snip_folder
+        snips = latest_snips(count, tr.clip_time if tr else None, tr.clip_seq if tr else None, include_files=files)
         if not snips:
+            if not files:
+                raise ArgusError(
+                    "No snip on the clipboard. The work profile doesn't read the Screenshots folder, so the user has to "
+                    "copy the snip (Win+Shift+S puts it on the clipboard)."
+                )
             raise ArgusError(
                 f"No snips found: the clipboard holds no image and {screenshots_dir()} has no screenshots. "
                 "The user can snip with Win+Shift+S."
@@ -311,7 +365,7 @@ class Session:
             what = f"saved snip {sn.path.name}" if sn.path else "image on the clipboard"
             shots.append(
                 Shot(image=sn.image, kind="snip", label=f"{what}, from {when}", origin=None, target={}, method=sn.source,
-                     taken=sn.when or time.time(), source=sn.path)
+                     taken=sn.when or time.time(), source=sn.path, profile=s.profile)
             )
         result = Result()
         if len(shots) > 1:
@@ -330,6 +384,11 @@ class Session:
         shot = mark.shot(scope)
         if shot is None:
             raise ArgusError("The latest mark's image files are missing (cleaned up or deleted).")
+        if not _profile_ok(shot, s):
+            raise ArgusError(
+                "The latest mark was made before the user's work profile was turned on, so Argus won't share it. "
+                f"They can mark again with {pretty_hotkey(s.hotkey_mark)}."
+            )
         self.used_marks.add(mark.id)
         what = mark.info.get("monitor" if scope == "monitor" else "window") or mark.info.get("monitor")
         result = Result().text(f"Hotkey mark from {ago(time.time() - mark.when)} ago: {what}.")
@@ -392,6 +451,7 @@ class Session:
         crop = Shot(
             image=img.crop((bx0, by0, bx1, by1)), kind="zoom", label=f'best match for "{text}" (from {cap.id})',
             origin=origin, target={}, method="crop", cursor=cap.shot.cursor, taken=cap.shot.taken,
+            profile=cap.shot.profile,
         )
         box = (best.box[0] - bx0, best.box[1] - by0, best.box[2] - bx0, best.box[3] - by0)
         result = Result().text(*lines)
@@ -419,6 +479,7 @@ class Session:
         s = self.guard()
         if baseline:
             before = testing.load_baseline(baseline)
+            _require_profile(before, s)
             after = recapture(self.desk(), s, before.target)
             name_before = f"baseline {baseline!r} (saved {ago(time.time() - before.taken)} ago)"
         elif capture_a:
@@ -453,7 +514,8 @@ class Session:
             _lv, left = render(before.image, max_side=half)
             right_view, right = render(after.image, max_side=half, boxes=boxes)
             combo = side_by_side(left, right, labels=(name_before, "now (changes boxed)"))
-            shot = Shot(image=combo, kind="compare", label=f"{name_before} vs now", origin=None, target={}, method="composite")
+            shot = Shot(image=combo, kind="compare", label=f"{name_before} vs now", origin=None, target={}, method="composite",
+                        profile=after.profile)
             cap = self.register(shot, grid=False)
             sc, cs = right_view.scale, cap.view.scale
             ox, oy = left.width + 12, 26
@@ -512,6 +574,7 @@ def status_text() -> str:
     return "\n".join(
         [
             f"Argus {__version__}: {state.describe()}",
+            f"Profile: {s.profile}" + (" (only allowed apps are visible)" if s.work else " (everything but the privacy list is visible)"),
             f"Data: {home()}",
             f"Settings: {config_path()}",
             f"Hotkeys: mark {pretty_hotkey(s.hotkey_mark)}, pause {pretty_hotkey(s.hotkey_pause)} (tray app)",

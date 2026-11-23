@@ -104,6 +104,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--minutes", type=float, help="resume automatically after this long")
     sub.add_parser("resume", help="allow captures again")
     sub.add_parser("status", help="paused or not, paths, hotkeys")
+    p = sub.add_parser("profile", help="show or switch the privacy profile (work = only allowed apps are visible)")
+    p.add_argument("name", nargs="?", choices=["personal", "work"])
     p = sub.add_parser("cleanup", help="delete captures older than the retention period")
     p.add_argument("--all", action="store_true", help="delete every saved capture and mark now")
 
@@ -192,6 +194,8 @@ def _run(args) -> int | None:
         return getattr(install, cmd)(args)
     if cmd in ("pause", "resume", "status", "cleanup"):
         return _privacy_cmd(args)
+    if cmd == "profile":
+        return _profile_cmd(args)
 
     from .service import Session
 
@@ -223,9 +227,15 @@ def _run(args) -> int | None:
         privacy.ensure_not_paused()
         desk = snapshot(NO_HOST)
         win = desk.window_under_cursor or desk.foreground_window
-        window_shot = capture_window(desk, win, s) if win else None
-        mark = save_mark(window_shot, capture_monitor(desk, desk.cursor_monitor, s))
-        print(f"Marked {win.label if win else desk.cursor_monitor.title} ({mark.id})")
+        window_shot, problem = None, ""
+        if win is not None:
+            try:
+                window_shot = capture_window(desk, win, s)
+            except ArgusError as exc:
+                problem = str(exc)
+        mark = save_mark(window_shot, capture_monitor(desk, desk.cursor_monitor, s), extra={"problem": problem} if problem else None)
+        what = privacy.display_name(win, s) if window_shot is not None and win else desk.cursor_monitor.title
+        print(f"Marked {what} ({mark.id})" + (f" - window not captured: {problem}" if problem else ""))
     elif cmd == "ocr":
         if args.file:
             result = asyncio.run(session.read_text(capture_id=args.file, positions=not args.plain))
@@ -290,6 +300,34 @@ def _privacy_cmd(args) -> int:
     return 0
 
 
+def _profile_cmd(args) -> int:
+    from . import config
+
+    if args.name:
+        try:
+            s = config.set_profile(args.name)
+        except ValueError as exc:
+            raise ArgusError(str(exc)) from None
+        print(f"Switched to the {s.profile} profile. It applies to the next capture.")
+    else:
+        s = config.settings()
+        print(f"Active profile: {s.profile}")
+    if s.work:
+        apps = ", ".join(sorted(s.allow_apps)) or "none"
+        print("Only allowed windows are visible; everything else is blacked out and titles are hidden.")
+        print(f"Allowed apps: {apps}")
+        print(f"Allowed browser-tab patterns: {', '.join(p.pattern for p in s.allow_browser_titles) or 'none'}")
+        if s.allow_titles:
+            print(f"Allowed title patterns: {', '.join(p.pattern for p in s.allow_titles)}")
+        if not (s.allow_apps or s.allow_browser_titles or s.allow_titles):
+            print(f"Nothing is allowed yet, so captures will be fully black. Add apps under [work] in {config.config_path()}.")
+    else:
+        print("Everything is visible except the [privacy] block list. `argus profile work` switches to the allow list.")
+    for problem in s.problems:
+        print(f"Config problem: {problem}")
+    return 0
+
+
 def _list_json(session) -> dict:
     from . import privacy
     from .config import settings
@@ -298,6 +336,8 @@ def _list_json(session) -> dict:
     desk = session.desk()
 
     def title(w) -> str:
+        if not privacy.allowed(w, s):
+            return "(hidden: work profile)"
         return "(hidden: privacy list)" if privacy.sensitive_reason(w, s) else w.title
 
     return {

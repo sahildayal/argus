@@ -20,7 +20,7 @@ from PIL import Image, ImageDraw
 
 from . import privacy, win32
 from .capture import capture_monitor, capture_window
-from .config import config_path, home, parse_hotkey, pretty_hotkey, settings
+from .config import config_path, home, parse_hotkey, pretty_hotkey, set_profile, settings
 from .desktop import NO_HOST, ArgusError, set_host, snapshot
 from .geometry import Rect
 from .marks import marks_dir, save_mark
@@ -95,7 +95,10 @@ class TrayApp:
     def _title(self) -> str:
         s = settings()
         state = privacy.pause_state().describe()
-        return f"Argus: {state}\nMark: {pretty_hotkey(s.hotkey_mark)} | Pause: {pretty_hotkey(s.hotkey_pause)}"
+        return (
+            f"Argus: {state}, {s.profile} profile\n"
+            f"Mark: {pretty_hotkey(s.hotkey_mark)} | Pause: {pretty_hotkey(s.hotkey_pause)}"
+        )
 
     def _menu(self) -> pystray.Menu:
         s = settings()
@@ -105,6 +108,24 @@ class TrayApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Pause captures", lambda: post(("pause", None)), checked=lambda _i: self.paused),
             pystray.MenuItem("Pause for 15 minutes", lambda: post(("pause15", None)), enabled=lambda _i: not self.paused),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                lambda _i: f"Profile: {settings().profile.capitalize()}",
+                pystray.Menu(
+                    pystray.MenuItem(
+                        "Personal (hide only the privacy list)",
+                        lambda: post(("profile", "personal")),
+                        checked=lambda _i: not settings().work,
+                        radio=True,
+                    ),
+                    pystray.MenuItem(
+                        "Work (show only allowed apps)",
+                        lambda: post(("profile", "work")),
+                        checked=lambda _i: settings().work,
+                        radio=True,
+                    ),
+                ),
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Open captures folder", lambda: post(("open", home() / "captures"))),
             pystray.MenuItem("Open marks folder", lambda: post(("open", marks_dir()))),
@@ -160,6 +181,8 @@ class TrayApp:
                 privacy.pause(15)
                 self._refresh()
                 self.pill("Argus paused for 15 minutes: AI tools can't see your screens", WARN)
+            elif action == "profile":
+                self.switch_profile(arg)
             elif action == "open":
                 os.startfile(arg)  # noqa: S606 - opening our own folders/files
             elif action == "hotkeys" and arg:
@@ -193,11 +216,27 @@ class TrayApp:
         save_mark(window_shot, monitor_shot, extra={"problem": problem} if problem else None)
         if window_shot is not None and win is not None:
             self.flash(win.rect, f"Marked for Argus: {win.app or win.process}")
+        elif problem and win is not None and not privacy.allowed(win, s):
+            self.flash(mon.rect, f"Marked {mon.title} - that window isn't allowed by your work profile", colour=WARN)
         elif problem:
             self.flash(mon.rect, f"Marked {mon.title} - that window is on your privacy list", colour=WARN)
         else:
             self.flash(mon.rect, f"Marked {mon.title}")
-        log.info("mark: %s", win.label if window_shot and win else mon.title)
+        log.info("mark: %s", privacy.display_name(win, s) if window_shot and win else mon.title)
+
+    def switch_profile(self, name: str) -> None:
+        try:
+            s = set_profile(name)
+        except ValueError as exc:
+            log.warning("profile switch failed: %s", exc)
+            self.pill("Argus couldn't switch profile: fix config.toml first", WARN, ms=3000)
+            return
+        self._refresh()
+        if s.work:
+            self.pill("Argus work profile: AI tools see only the apps you allowed", ACCENT, ms=2200)
+        else:
+            self.pill("Argus personal profile: everything but your privacy list is visible", WARN, ms=2200)
+        log.info("profile: %s", s.profile)
 
     def toggle_pause(self) -> None:
         if privacy.pause_state().paused:

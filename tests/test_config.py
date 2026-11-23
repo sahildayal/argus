@@ -48,3 +48,90 @@ def test_bad_hotkeys():
         with pytest.raises(ValueError):
             parse_hotkey(bad)
     assert pretty_hotkey("ctrl+alt+s") == "Ctrl+Alt+S"
+
+
+# ----------------------------------------------------------------- profiles
+
+
+def test_profile_defaults_to_personal_with_empty_allow_lists():
+    s = Settings.from_toml(DEFAULT_CONFIG)
+    assert s.profile == "personal" and not s.work and not s.problems
+    assert not s.allow_apps and not s.allow_browser_titles and not s.allow_titles and not s.allow_snip_folder
+
+
+def test_work_profile_settings_are_parsed():
+    s = Settings.from_toml(
+        '[profile]\nactive = "Work"\n[work]\nallow_apps = ["Code.exe"]\n'
+        "allow_browser_titles = ['\\blocalhost\\b']\nallow_titles = ['^Jira']\nallow_snip_folder = true\n"
+    )
+    assert s.work and s.allow_apps == {"code.exe"} and s.allow_snip_folder
+    assert s.allow_browser_titles[0].search("LOCALHOST:3000 - Google Chrome")
+    assert s.allow_titles[0].search("Jira board")
+
+
+def test_old_config_files_without_the_new_sections_still_work():
+    s = Settings.from_toml("[capture]\nmax_side = 1568\n")
+    assert s.profile == "personal" and not s.problems
+    s = Settings.from_toml('[profile]\nactive = "work"\n')  # no [work] section: nothing allowed
+    assert s.work and not s.allow_apps and not s.problems
+
+
+def test_bad_allow_regex_is_reported():
+    s = Settings.from_toml('[profile]\nactive = "work"\n[work]\nallow_browser_titles = ["(oops"]\n')
+    assert s.work and not s.allow_browser_titles
+    assert any("work.allow_browser_titles: bad regex" in p for p in s.problems)
+
+
+def test_unknown_profile_fails_closed():
+    s = Settings.from_toml('[profile]\nactive = "wrok"\n')
+    assert s.work and any("unknown profile" in p for p in s.problems)
+
+
+def test_broken_file_keeps_the_work_profile():
+    s = Settings.from_toml('[profile]\nactive = "work"\n[work\nallow_apps = [\n')
+    assert s.work and not s.allow_apps and s.problems
+    assert not Settings.from_toml("not = = toml").work
+
+
+def test_set_profile_edits_only_that_line(argus_home):
+    config.settings()  # writes the default file
+    path = argus_home / "config.toml"
+    original = path.read_text(encoding="utf-8")
+    assert config.set_profile("work").work
+    changed = path.read_text(encoding="utf-8")
+    assert changed == original.replace('active = "personal"', 'active = "work"')
+    assert not config.set_profile("personal").work
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_set_profile_keeps_comments_and_adds_a_missing_section(argus_home):
+    argus_home.mkdir(parents=True, exist_ok=True)
+    path = argus_home / "config.toml"
+    path.write_text("# my notes\n[capture]\nmax_side = 1568  # small\n", encoding="utf-8")
+    s = config.set_profile("work")
+    assert s.work and s.max_side == 1568
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("# my notes\n[capture]\nmax_side = 1568  # small\n") and '[profile]\nactive = "work"' in text
+    path.write_text('[profile] # which one\n# active = "personal"\nactive = "personal" # set by me\n', encoding="utf-8")
+    config.set_profile("work")
+    assert path.read_text(encoding="utf-8") == '[profile] # which one\n# active = "personal"\nactive = "work" # set by me\n'
+
+
+def test_set_profile_refuses_bad_names_and_broken_files(argus_home):
+    with pytest.raises(ValueError):
+        config.set_profile("home")
+    argus_home.mkdir(parents=True, exist_ok=True)
+    (argus_home / "config.toml").write_text("[profile\nactive = 'personal'\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="valid TOML"):
+        config.set_profile("work")
+
+
+def test_cli_profile_command(argus_home, capsys):
+    from argus.cli import main
+
+    assert main(["profile"]) == 0
+    assert "Active profile: personal" in capsys.readouterr().out
+    assert main(["profile", "work"]) == 0
+    out = capsys.readouterr().out
+    assert "Switched to the work profile" in out and "Nothing is allowed yet" in out
+    assert config.settings().work

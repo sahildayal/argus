@@ -14,7 +14,7 @@ from . import win32
 from .config import Settings
 from .desktop import ArgusError, Desktop, Monitor, Window, find_monitors, find_windows
 from .geometry import Rect
-from .privacy import redact, sensitive_reason
+from .privacy import check_window, display_name, redact, sensitive_reason, shown
 
 
 @dataclass
@@ -32,6 +32,7 @@ class Shot:
     window: Window | None = None
     taken: float = field(default_factory=time.time)
     source: Path | None = None  # the file a snip/mark came from
+    profile: str = ""  # privacy profile it was taken under ("" = unknown, e.g. any image file)
 
     @property
     def cursor_in_image(self) -> tuple[int, int] | None:
@@ -68,6 +69,7 @@ def capture_monitor(desk: Desktop, mon: Monitor, s: Settings) -> Shot:
         hidden=hidden,
         cursor=desk.cursor,
         monitor=mon,
+        profile=s.profile,
     )
 
 
@@ -91,6 +93,7 @@ def capture_region(desk: Desktop, rect: Rect, s: Settings, label: str | None = N
         hidden=hidden,
         cursor=desk.cursor,
         monitor=mon,
+        profile=s.profile,
     )
 
 
@@ -116,9 +119,10 @@ def render_window(win: Window) -> Image.Image | None:
 
 
 def capture_window(desk: Desktop, win: Window, s: Settings) -> Shot:
+    check_window(win, s)  # work profile: refuse rather than return a black image
     if win.minimized:
         raise ArgusError(
-            f"{win.label} is minimized, so there's nothing on screen to capture. Ask the user to restore it, "
+            f"{display_name(win, s)} is minimized, so there's nothing on screen to capture. Ask the user to restore it, "
             "or capture a monitor instead."
         )
     reason = sensitive_reason(win, s)
@@ -131,12 +135,13 @@ def capture_window(desk: Desktop, win: Window, s: Settings) -> Shot:
     base = Shot(
         image=Image.new("RGB", (1, 1)),
         kind="window",
-        label=win.label + (f" on {mon.title}" if mon else ""),
+        label=display_name(win, s) + (f" on {mon.title}" if mon else ""),
         origin=None,
         target={"window": win.hwnd, "title": win.title, "process": win.process},
         cursor=desk.cursor,
         monitor=mon,
         window=win,
+        profile=s.profile,
     )
     visible = desk.visible_fraction(win)
     if visible >= 0.995:
@@ -162,7 +167,7 @@ def capture_window(desk: Desktop, win: Window, s: Settings) -> Shot:
 
     area = win.rect.intersect(desk.bounds)
     if area is None:
-        raise ArgusError(f"{win.label} is entirely off-screen and refuses to render offscreen.")
+        raise ArgusError(f"{display_name(win, s)} is entirely off-screen and refuses to render offscreen.")
     base.image = grab(area)
     base.origin = (area.x, area.y)
     base.hidden = redact(base.image, base.origin, desk, s)
@@ -190,17 +195,23 @@ def capture(desk: Desktop, s: Settings, monitor=None, window=None, region=None) 
     rect = _parse_region(region) if region is not None else None
 
     if window is not None:
-        matches = find_windows(desk, window)
+
+        def name(w: Window) -> str:
+            return display_name(w, s)
+
+        # In the work profile, hidden windows can't be matched by title (no probing).
+        matches = find_windows(desk, window, name=name, titled=(lambda w: shown(w, s)) if s.work else None)
         win = matches[0]
+        check_window(win, s)
         if rect is not None:
             mon = desk.monitor(win.monitor) if win.monitor else None
-            shot = capture_region(desk, rect.offset(win.rect.x, win.rect.y), s, label=f"part of {win.label}")
+            shot = capture_region(desk, rect.offset(win.rect.x, win.rect.y), s, label=f"part of {name(win)}")
             shot.window, shot.monitor = win, mon
         else:
             shot = capture_window(desk, win, s)
         others = [w for w in matches[1:4] if w.hwnd != win.hwnd]
         if others:
-            shot.notes.append("Also matched: " + "; ".join(f"{w.label} [{w.handle}]" for w in others) + ".")
+            shot.notes.append("Also matched: " + "; ".join(f"{name(w)} [{w.handle}]" for w in others) + ".")
         return [shot]
 
     if monitor is not None:
@@ -225,7 +236,8 @@ def recapture(desk: Desktop, s: Settings, target: dict) -> Shot:
             # The app restarted: find the same program with the closest title.
             candidates = [w for w in desk.windows if w.process.lower() == str(target.get("process", "")).lower()]
             if not candidates:
-                raise ArgusError(f'The window "{target.get("title", "?")}" is gone and no {target.get("process")} window is open.')
+                what = "That window" if s.work else f'The window "{target.get("title", "?")}"'
+                raise ArgusError(f"{what} is gone and no {target.get('process')} window is open.")
             title = str(target.get("title", ""))
             win = max(candidates, key=lambda w: (_similar(w.title, title), -w.z))
         return capture_window(desk, win, s)

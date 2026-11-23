@@ -13,6 +13,15 @@ DEFAULT_CONFIG = """\
 # Argus settings. Edits apply to the next capture - nothing needs restarting
 # except the tray app for hotkey changes.
 
+[profile]
+# "personal": everything is visible except what [privacy] blocks (a block list).
+# "work": an allow list - only windows allowed under [work] are visible; the
+#   desktop, the taskbar and every other window are blacked out, and their
+#   titles never leave Argus. [privacy] still applies on top. Use it wherever
+#   screens can show confidential data (patient records, customer data, ...).
+# Switch with the tray menu or `argus profile work` / `argus profile personal`.
+active = "personal"
+
 [capture]
 # Longest side (px) of images sent to the AI. 2000 keeps long sessions with
 # many screenshots inside the API's multi-image limit, and lets a 1080p
@@ -69,6 +78,24 @@ browsers = [
   "arc.exe", "zen.exe", "librewolf.exe", "waterfox.exe", "floorp.exe", "chromium.exe",
   "thorium.exe", "comet.exe", "dia.exe", "iexplore.exe",
 ]
+
+[work]
+# Only used when [profile] active = "work". A window is visible only if it
+# matches one of these AND isn't blocked by [privacy]. Everything else -
+# including the desktop, the taskbar and windows of unknown programs - is
+# blacked out, and its title is replaced by "<app> (hidden, work profile)".
+# Programs whose windows are allowed (exe names, any case), e.g.
+#   allow_apps = ["Code.exe", "WindowsTerminal.exe", "devenv.exe"]
+allow_apps = []
+# Regexes (case-insensitive) matched against browser window titles, i.e. the
+# active tab's title. Switching to a tab that doesn't match hides the window
+# again. e.g. allow_browser_titles = ['\\blocalhost\\b', '\\bgithub\\.com\\b']
+allow_browser_titles = []
+# Regexes matched against any window title (optional; prefer allow_apps).
+allow_titles = []
+# Let latest_snip read saved snips from Pictures\\Screenshots. Off by default:
+# a snip is an image of unknown origin, so Argus can't black anything out in it.
+allow_snip_folder = false
 """
 
 
@@ -98,7 +125,16 @@ class Settings:
     redact_browser_titles: tuple[re.Pattern, ...] = ()
     redact_titles: tuple[re.Pattern, ...] = ()
     browsers: frozenset[str] = frozenset()
+    profile: str = "personal"  # "personal" (block list) | "work" (allow list)
+    allow_apps: frozenset[str] = frozenset()
+    allow_browser_titles: tuple[re.Pattern, ...] = ()
+    allow_titles: tuple[re.Pattern, ...] = ()
+    allow_snip_folder: bool = False
     problems: tuple[str, ...] = field(default=())
+
+    @property
+    def work(self) -> bool:
+        return self.profile == "work"
 
     @classmethod
     def from_toml(cls, text: str) -> Settings:
@@ -106,21 +142,34 @@ class Settings:
         try:
             data = tomllib.loads(text)
         except tomllib.TOMLDecodeError as exc:
-            problems.append(f"config.toml is not valid TOML ({exc}); using defaults")
             data = tomllib.loads(DEFAULT_CONFIG)
+            if _WORK_LINE.search(text):
+                # Fail closed: a typo must not silently drop a work profile back
+                # to personal. Work with empty allow lists hides everything.
+                data["profile"]["active"] = "work"
+                problems.append(
+                    f"config.toml is not valid TOML ({exc}); using defaults, but staying in the work profile with nothing allowed"
+                )
+            else:
+                problems.append(f"config.toml is not valid TOML ({exc}); using defaults")
         defaults = tomllib.loads(DEFAULT_CONFIG)
 
         def get(section: str, key: str):
             return data.get(section, {}).get(key, defaults[section][key])
 
-        def patterns(key: str) -> tuple[re.Pattern, ...]:
+        def patterns(section: str, key: str) -> tuple[re.Pattern, ...]:
             out = []
-            for raw in get("privacy", key):
+            for raw in get(section, key):
                 try:
                     out.append(re.compile(raw, re.IGNORECASE))
                 except re.error as exc:
-                    problems.append(f"privacy.{key}: bad regex {raw!r} ({exc})")
+                    problems.append(f"{section}.{key}: bad regex {raw!r} ({exc})")
             return tuple(out)
+
+        profile = str(get("profile", "active")).strip().lower()
+        if profile not in PROFILES:
+            problems.append(f'profile.active: unknown profile {profile!r} (use "personal" or "work"); using "work" to be safe')
+            profile = "work"
 
         return cls(
             max_side=max(256, int(get("capture", "max_side"))),
@@ -133,11 +182,20 @@ class Settings:
             retention_days=float(get("privacy", "retention_days")),
             redact_notifications=bool(get("privacy", "redact_notifications")),
             redact_apps=frozenset(a.lower() for a in get("privacy", "redact_apps")),
-            redact_browser_titles=patterns("redact_browser_titles"),
-            redact_titles=patterns("redact_titles"),
+            redact_browser_titles=patterns("privacy", "redact_browser_titles"),
+            redact_titles=patterns("privacy", "redact_titles"),
             browsers=frozenset(b.lower() for b in get("privacy", "browsers")),
+            profile=profile,
+            allow_apps=frozenset(a.lower() for a in get("work", "allow_apps")),
+            allow_browser_titles=patterns("work", "allow_browser_titles"),
+            allow_titles=patterns("work", "allow_titles"),
+            allow_snip_folder=bool(get("work", "allow_snip_folder")),
             problems=tuple(problems),
         )
+
+
+PROFILES = ("personal", "work")
+_WORK_LINE = re.compile(r"""^\s*active\s*=\s*["']work["']""", re.IGNORECASE | re.MULTILINE)
 
 
 _lock = threading.Lock()
@@ -155,6 +213,58 @@ def settings() -> Settings:
         if _cache is None or _cache[0] != mtime:
             _cache = (mtime, Settings.from_toml(path.read_text(encoding="utf-8")))
         return _cache[1]
+
+
+def set_profile(name: str) -> Settings:
+    """Switch ``[profile] active`` in config.toml, editing just that line so the
+    user's comments and layout survive. Returns the new settings."""
+    global _cache
+    name = name.strip().lower()
+    if name not in PROFILES:
+        raise ValueError(f"unknown profile {name!r}; use one of: {', '.join(PROFILES)}")
+    settings()  # writes the default file if there is none
+    path = config_path()
+    with _lock:
+        with open(path, encoding="utf-8", newline="") as f:  # keep the file's line endings
+            text = f.read()
+        new = _with_profile(text, name)
+        try:
+            check = tomllib.loads(new).get("profile", {}).get("active")
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(f"{path} isn't valid TOML ({exc}); fix it first, then switch profiles") from None
+        if check != name:
+            raise ValueError(f"couldn't update [profile] active in {path}; edit it by hand")
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(new, encoding="utf-8", newline="")
+        os.replace(tmp, path)
+        _cache = None
+    return settings()
+
+
+_SECTION = re.compile(r"^\s*\[([^\[\]]+)\]\s*(#.*)?$")
+_ACTIVE = re.compile(r"""^(\s*active\s*=\s*)("[^"]*"|'[^']*'|[^\s#]+)(.*)$""")
+
+
+def _with_profile(text: str, name: str) -> str:
+    """*text* with ``[profile] active`` set to *name*; nothing else changes."""
+    lines = text.splitlines(keepends=True)
+    header = next((i for i, line in enumerate(lines) if (m := _SECTION.match(line)) and m.group(1).strip() == "profile"), None)
+    if header is None:
+        sep = "" if not text or text.endswith("\n") else "\n"
+        return f'{text}{sep}\n[profile]\nactive = "{name}"\n'
+    for i in range(header + 1, len(lines)):
+        if _SECTION.match(lines[i]):
+            break
+        body = lines[i].rstrip("\r\n")
+        m = _ACTIVE.match(body)
+        if m:
+            lines[i] = f'{m.group(1)}"{name}"{m.group(3)}{lines[i][len(body):]}'
+            return "".join(lines)
+    newline = "\r\n" if lines[header].endswith("\r\n") else "\n"
+    if not lines[header].endswith("\n"):
+        lines[header] += newline
+    lines.insert(header + 1, f'active = "{name}"{newline}')
+    return "".join(lines)
 
 
 # ------------------------------------------------------------------- hotkeys

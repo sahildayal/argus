@@ -9,6 +9,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import PurePath
 
@@ -508,8 +509,17 @@ def _monitor_options(desk: Desktop) -> str:
     return f"Monitors: {opts}. Also: all, primary, cursor, active" + (", laptop." if any(m.builtin for m in desk.monitors) else ".")
 
 
-def find_windows(desk: Desktop, spec: str | int) -> list[Window]:
-    """Windows matching a selector, best match first."""
+def find_windows(
+    desk: Desktop,
+    spec: str | int,
+    *,
+    name: Callable[[Window], str] | None = None,
+    titled: Callable[[Window], bool] | None = None,
+) -> list[Window]:
+    """Windows matching a selector, best match first. *name* is how windows are
+    named in error messages (default: their label); windows for which *titled*
+    is False are matched by app, exe and handle only, never by title, so a
+    selector can't be used to probe a hidden window's title."""
     text = str(spec).strip()
     low = text.lower()
     if low in ("active", "focused", "foreground", "current"):
@@ -532,11 +542,12 @@ def find_windows(desk: Desktop, spec: str | int) -> list[Window]:
     words = [t for t in re.split(r"\W+", low) if t]
     scored: list[tuple[float, Window]] = []
     for w in desk.windows:
-        title, app, proc = w.title.lower(), w.app.lower(), PurePath(w.process.lower()).stem
+        title = w.title.lower() if titled is None or titled(w) else ""
+        app, proc = w.app.lower(), PurePath(w.process.lower()).stem
         haystack = f"{title} {app} {proc}"
-        if title == low:
+        if title and title == low:
             score = 100.0
-        elif low and low in title:
+        elif low and title and low in title:
             score = 85.0
         elif low and (low in app or proc == low or proc.startswith(low)):
             score = 75.0
@@ -554,7 +565,7 @@ def find_windows(desk: Desktop, spec: str | int) -> list[Window]:
             scored.append((score, w))
     scored.sort(key=lambda sw: (-sw[0], sw[1].z))
     if not scored:
-        raise ArgusError(f'No window matches "{text}". Open windows: {_window_options(desk)}')
+        raise ArgusError(f'No window matches "{text}". Open windows: {_window_options(desk, name=name)}')
     return [w for _, w in scored]
 
 
@@ -565,6 +576,6 @@ _APP_NICKNAMES = {
 }
 
 
-def _window_options(desk: Desktop, limit: int = 12) -> str:
+def _window_options(desk: Desktop, limit: int = 12, name: Callable[[Window], str] | None = None) -> str:
     wins = [w for w in desk.windows if not w.host][:limit]
-    return "; ".join(f"{w.label} [{w.handle}]" for w in wins) or "none"
+    return "; ".join(f"{name(w) if name else w.label} [{w.handle}]" for w in wins) or "none"

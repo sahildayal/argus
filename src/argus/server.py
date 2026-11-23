@@ -86,7 +86,7 @@ def _instructions() -> str:
 - Images can be downscaled to fit. Don't guess at small or blurry text: zoom(capture_id, box=[x1,y1,x2,y2]) in the coordinates of the image you saw, or read_text for exact text.
 - The user can hand you captures: latest_snip (their Win+Shift+S snips / clipboard image) and latest_mark ({pretty_hotkey(s.hotkey_mark)} hotkey via the tray app).
 - Testing: save_baseline + compare for visual regressions; wait_for to wait for a change, a settled screen, or some text.
-- Privacy is the user's call: some windows are blacked out by their privacy list and they can pause Argus entirely. Never try to work around either - tell the user instead."""
+- Privacy is the user's call: some windows are blacked out by their privacy list and they can pause Argus entirely. In their work profile only the apps they allowed are visible; everything else is blacked out and listed without titles. Never try to work around any of this - tell the user instead."""
 
 
 mcp = MCPServer("argus", title="Argus", version=__version__, instructions=_instructions())

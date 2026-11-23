@@ -131,7 +131,8 @@ can reopen it later by path.
   uses it.
 - **Ctrl+Alt+P**: pause or resume Argus. While paused, every tool in every AI
   app refuses to capture (and the icon turns grey with a red slash).
-- Menu: pause for 15 minutes, open captures/marks folders, edit settings.
+- Menu: pause for 15 minutes, switch between the personal and work profiles
+  (the tooltip shows which one is on), open captures/marks folders, edit settings.
 
 Change the hotkeys in `~/.argus/config.toml`, then restart the tray.
 
@@ -140,6 +141,32 @@ Change the hotkeys in `~/.argus/config.toml`, then restart the tray.
 Argus gives AI tools sight of your screens, so it's built to make that a
 deliberate choice:
 
+- **Two profiles.** *Personal* (the default) uses a block list: everything is
+  visible except the windows listed below. *Work* uses an allow list: only the
+  apps and browser tabs you allow are visible. The desktop, the taskbar, every
+  other window and any area no window covers are blacked out. Their titles
+  never leave Argus either, because a title alone can be confidential (say,
+  `Doe, John (MRN 123456)`). Lists, captions and error messages name hidden
+  windows as `<App> (hidden, work profile)`, and the AI can't capture them by
+  name or match them by title. Use the work profile wherever your screens can
+  show patient, customer or other regulated data. Switch with the tray menu or
+  `argus profile work` / `argus profile personal`, and set what's allowed
+  under `[work]` in `~/.argus/config.toml`:
+
+  ```toml
+  [profile]
+  active = "work"
+
+  [work]
+  allow_apps = ["Code.exe", "WindowsTerminal.exe"]   # exe names
+  allow_browser_titles = ['\blocalhost\b']           # regexes on the active tab's title
+  ```
+
+  The block list below still applies on top of the allow list. In the work
+  profile `latest_snip` only reads the clipboard, not the Screenshots folder
+  (a snip can't be redacted), unless you set `allow_snip_folder = true`.
+  Captures, marks and baselines taken under the personal profile aren't
+  shown again after you switch to work.
 - **Blacked out before anything leaves Argus:** password managers, WhatsApp,
   Signal, Telegram, Messenger, Phone Link, Windows notification toasts, and
   browser tabs whose titles match banking/payments/messaging patterns. The AI
@@ -178,13 +205,15 @@ argus find "Submit" -m cursor
 argus wait text --text "Compiled successfully" -w "Terminal" -t 120   # exit 0 = seen, 1 = timeout
 argus baseline save login -w "localhost:3000"; argus baseline compare login
 argus pause --minutes 30; argus resume; argus status
+argus profile; argus profile work             # show / switch the privacy profile
 ```
 
 ## Settings: `~/.argus/config.toml`
 
 Created with comments on first run. You can set the image size sent to the AI,
 the grid default, the mouse marker, how fresh a mark must be for `look`, the
-hotkeys, retention, and the privacy lists. Changes apply on the next capture;
+hotkeys, retention, the privacy profile and its block and allow lists. Changes
+apply on the next capture;
 hotkey changes need a tray restart.
 
 ## Troubleshooting

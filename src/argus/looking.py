@@ -8,6 +8,7 @@ under the mouse is offered as an alternative."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .desktop import Desktop, Window
@@ -30,8 +31,8 @@ class Choice:
     host: Window | None = None  # the chat window that was skipped
 
 
-def _usable(w: Window | None) -> bool:
-    return w is not None and w.is_app and not w.host and not w.minimized
+def _usable_window(w: Window | None, allow: Callable[[Window], bool] | None = None) -> bool:
+    return w is not None and w.is_app and not w.host and not w.minimized and (allow is None or allow(w))
 
 
 def host_label(desk: Desktop) -> str:
@@ -41,9 +42,14 @@ def host_label(desk: Desktop) -> str:
     return desk.host.app or "this chat"
 
 
-def choose(desk: Desktop, history: list[tuple[float, int]]) -> Choice:
+def choose(desk: Desktop, history: list[tuple[float, int]], allow: Callable[[Window], bool] | None = None) -> Choice:
     """Pick the window the user most likely means. *history* is (time, hwnd)
-    focus changes, newest first."""
+    focus changes, newest first. Windows *allow* rejects (the work profile's
+    hidden ones) are never picked or offered."""
+
+    def _usable(w: Window | None) -> bool:
+        return _usable_window(w, allow)
+
     fg = desk.foreground_window
     host_window = fg if fg is not None and fg.host else None
     chat = host_label(desk)

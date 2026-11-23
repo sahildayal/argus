@@ -116,6 +116,7 @@ def meta(shot: Shot) -> dict:
         "taken": shot.taken,
         "cursor": shot.cursor,
         "hidden": shot.hidden,
+        "profile": shot.profile,
     }
 
 
@@ -150,4 +151,5 @@ def open_file(path: str | Path) -> Shot:
         cursor=cursor,  # type: ignore[arg-type]
         taken=float(data.get("taken") or p.stat().st_mtime),
         source=p,
+        profile=str(data.get("profile") or ""),
     )
