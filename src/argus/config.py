@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import os
 import re
 import threading
 import tomllib
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 
 DEFAULT_CONFIG = """\
@@ -89,9 +93,12 @@ browsers = [
 allow_apps = []
 # Regexes (case-insensitive) matched against browser window titles, i.e. the
 # active tab's title. Switching to a tab that doesn't match hides the window
-# again. e.g. allow_browser_titles = ['\\blocalhost\\b', '\\bgithub\\.com\\b']
+# again. NOT a security boundary: a page sets its own title, so any website
+# can call itself "localhost". For strict control, use a separate browser (or
+# browser exe) only for work tools and put that in allow_apps instead.
 allow_browser_titles = []
-# Regexes matched against any window title (optional; prefer allow_apps).
+# Regexes matched against any window title (a convenience, not a boundary:
+# programs choose their own titles; prefer allow_apps).
 allow_titles = []
 # Let latest_snip read saved snips from Pictures\\Screenshots. Off by default:
 # a snip is an image of unknown origin, so Argus can't black anything out in it.
@@ -108,6 +115,43 @@ def home() -> Path:
 
 def config_path() -> Path:
     return home() / "config.toml"
+
+
+# What config.toml may contain. STRS = a list of strings; NUMBER = int or float.
+STRS, NUMBER = "list of strings", "number"
+_SCHEMA: dict[str, dict[str, object]] = {
+    "profile": {"active": str},
+    "capture": {"max_side": int, "max_side_multi": int, "grid": bool, "cursor_marker": bool},
+    "look": {"mark_freshness_seconds": NUMBER},
+    "hotkeys": {"mark": str, "pause": str},
+    "privacy": {
+        "retention_days": NUMBER, "redact_notifications": bool, "redact_apps": STRS,
+        "redact_browser_titles": STRS, "redact_titles": STRS, "browsers": STRS,
+    },
+    "work": {"allow_apps": STRS, "allow_browser_titles": STRS, "allow_titles": STRS, "allow_snip_folder": bool},
+}
+# Sections whose mistakes can weaken the work profile: any problem in them locks
+# the work profile down to "nothing allowed" instead of half-applying the file.
+_CRITICAL = {"profile", "privacy", "work"}
+
+
+def _type_ok(value: object, kind: object) -> bool:
+    if kind is bool:
+        return type(value) is bool
+    if kind is int:
+        return type(value) is int
+    if kind is NUMBER:
+        return type(value) in (int, float)
+    if kind is str:
+        return type(value) is str
+    if kind is STRS:
+        return type(value) is list and all(type(v) is str for v in value)
+    return False
+
+
+def _kind_name(kind: object) -> str:
+    names = {bool: "true or false", int: "a whole number", str: "a quoted string"}
+    return names.get(kind, f"a {kind}")  # type: ignore[call-overload]
 
 
 @dataclass(frozen=True)
@@ -136,42 +180,87 @@ class Settings:
     def work(self) -> bool:
         return self.profile == "work"
 
+    @cached_property
+    def policy(self) -> str:
+        """A short hash of everything that decides what the AI may see (profile,
+        allow lists, block lists). Captures are stamped with it; in the work
+        profile an image is only shown again under the same policy."""
+        data = {
+            "profile": self.profile,
+            "allow_apps": sorted(self.allow_apps),
+            "allow_browser_titles": [p.pattern for p in self.allow_browser_titles],
+            "allow_titles": [p.pattern for p in self.allow_titles],
+            "allow_snip_folder": self.allow_snip_folder,
+            "redact_apps": sorted(self.redact_apps),
+            "redact_browser_titles": [p.pattern for p in self.redact_browser_titles],
+            "redact_titles": [p.pattern for p in self.redact_titles],
+            "browsers": sorted(self.browsers),
+            "redact_notifications": self.redact_notifications,
+        }
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:32]
+
     @classmethod
     def from_toml(cls, text: str) -> Settings:
-        problems: list[str] = []
         try:
             data = tomllib.loads(text)
         except tomllib.TOMLDecodeError as exc:
-            data = tomllib.loads(DEFAULT_CONFIG)
-            if _WORK_LINE.search(text):
-                # Fail closed: a typo must not silently drop a work profile back
-                # to personal. Work with empty allow lists hides everything.
-                data["profile"]["active"] = "work"
-                problems.append(
-                    f"config.toml is not valid TOML ({exc}); using defaults, but staying in the work profile with nothing allowed"
-                )
-            else:
-                problems.append(f"config.toml is not valid TOML ({exc}); using defaults")
+            return cls.locked(f"config.toml is not valid TOML ({exc})")
+        return cls._from_data(data, [], broken=False)
+
+    @classmethod
+    def locked(cls, why: str) -> Settings:
+        """Settings for a config file Argus can't read: the work profile with
+        nothing allowed. Failing closed matters more than a personal-profile user
+        seeing black captures until they fix the file (the problem says why)."""
+        return cls._from_data({}, [f"{why}. Until it's fixed, Argus uses the work profile with nothing allowed."], broken=True)
+
+    @classmethod
+    def _from_data(cls, data: dict, problems: list[str], broken: bool) -> Settings:
         defaults = tomllib.loads(DEFAULT_CONFIG)
+        critical: set[str] = set()  # sections with a problem
+
+        def bad(section: str, message: str) -> None:
+            problems.append(message)
+            critical.add(section)
+
+        for section, value in data.items():
+            if section not in _SCHEMA:
+                problems.append(f"[{section}]: unknown section (ignored)")
+            elif not isinstance(value, dict):
+                bad(section, f"{section}: should be a [{section}] section, not a single value")
+            else:
+                for key in value:
+                    if key not in _SCHEMA[section]:
+                        bad(section, f"{section}.{key}: unknown setting (typo?)")
 
         def get(section: str, key: str):
-            return data.get(section, {}).get(key, defaults[section][key])
+            sect = data.get(section)
+            if not isinstance(sect, dict) or key not in sect:
+                return defaults[section][key]
+            value, kind = sect[key], _SCHEMA[section][key]
+            if _type_ok(value, kind):
+                return value
+            # The value itself is never echoed: problems are shown to the AI.
+            bad(section, f"{section}.{key}: should be {_kind_name(kind)}, not {type(value).__name__}; using the default")
+            return defaults[section][key]
 
         def patterns(section: str, key: str) -> tuple[re.Pattern, ...]:
             out = []
-            for raw in get(section, key):
+            for i, raw in enumerate(get(section, key)):
                 try:
                     out.append(re.compile(raw, re.IGNORECASE))
                 except re.error as exc:
-                    problems.append(f"{section}.{key}: bad regex {raw!r} ({exc})")
+                    bad(section, f"{section}.{key}: entry {i + 1} is not a valid regex ({exc})")
             return tuple(out)
 
-        profile = str(get("profile", "active")).strip().lower()
-        if profile not in PROFILES:
-            problems.append(f'profile.active: unknown profile {profile!r} (use "personal" or "work"); using "work" to be safe')
-            profile = "work"
+        sect = data.get("profile")
+        raw = sect.get("active", "personal") if isinstance(sect, dict) else "personal"
+        profile = raw.strip().lower() if isinstance(raw, str) else ""
+        if isinstance(raw, str) and profile not in PROFILES:
+            bad("profile", 'profile.active: unknown profile (use "personal" or "work"); using "work" with nothing allowed to be safe')
+        get("profile", "active")  # reports a non-string value
 
-        return cls(
+        values = dict(
             max_side=max(256, int(get("capture", "max_side"))),
             max_side_multi=max(256, int(get("capture", "max_side_multi"))),
             grid=bool(get("capture", "grid")),
@@ -185,17 +274,25 @@ class Settings:
             redact_browser_titles=patterns("privacy", "redact_browser_titles"),
             redact_titles=patterns("privacy", "redact_titles"),
             browsers=frozenset(b.lower() for b in get("privacy", "browsers")),
-            profile=profile,
             allow_apps=frozenset(a.lower() for a in get("work", "allow_apps")),
             allow_browser_titles=patterns("work", "allow_browser_titles"),
             allow_titles=patterns("work", "allow_titles"),
             allow_snip_folder=bool(get("work", "allow_snip_folder")),
-            problems=tuple(problems),
         )
+        # Fail closed: an unreadable file or a broken [profile] means work; a
+        # mistake anywhere that shapes the work profile means nothing is allowed
+        # (a half-applied file could leave an allow rule active without the
+        # block rule meant to go with it).
+        if broken or "profile" in critical:
+            profile = "work"
+        if profile == "work" and (broken or critical & _CRITICAL):
+            if not broken:
+                problems.append("Because of the problem(s) above, the work profile allows nothing until config.toml is fixed.")
+            values.update(allow_apps=frozenset(), allow_browser_titles=(), allow_titles=(), allow_snip_folder=False)
+        return cls(profile=profile, problems=tuple(problems), **values)
 
 
 PROFILES = ("personal", "work")
-_WORK_LINE = re.compile(r"""^\s*active\s*=\s*["']work["']""", re.IGNORECASE | re.MULTILINE)
 
 
 _lock = threading.Lock()
@@ -211,13 +308,19 @@ def settings() -> Settings:
             path.write_text(DEFAULT_CONFIG, encoding="utf-8")
         mtime = path.stat().st_mtime
         if _cache is None or _cache[0] != mtime:
-            _cache = (mtime, Settings.from_toml(path.read_text(encoding="utf-8")))
+            try:
+                parsed = Settings.from_toml(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError) as exc:
+                parsed = Settings.locked(f"config.toml can't be read ({type(exc).__name__})")
+            _cache = (mtime, parsed)
         return _cache[1]
 
 
 def set_profile(name: str) -> Settings:
     """Switch ``[profile] active`` in config.toml, editing just that line so the
-    user's comments and layout survive. Returns the new settings."""
+    user's comments and layout survive. Returns the new settings. The edit is
+    verified by parsing the file before and after: only profile.active may
+    change, or the file is left alone."""
     global _cache
     name = name.strip().lower()
     if name not in PROFILES:
@@ -227,13 +330,23 @@ def set_profile(name: str) -> Settings:
     with _lock:
         with open(path, encoding="utf-8", newline="") as f:  # keep the file's line endings
             text = f.read()
-        new = _with_profile(text, name)
         try:
-            check = tomllib.loads(new).get("profile", {}).get("active")
+            old = tomllib.loads(text)
         except tomllib.TOMLDecodeError as exc:
             raise ValueError(f"{path} isn't valid TOML ({exc}); fix it first, then switch profiles") from None
-        if check != name:
-            raise ValueError(f"couldn't update [profile] active in {path}; edit it by hand")
+        if "profile" in old and not isinstance(old["profile"], dict):
+            raise ValueError(f"{path} has a 'profile' value that isn't a [profile] section; fix it first")
+        new = _with_profile(text, name)
+        try:
+            parsed = tomllib.loads(new)
+        except tomllib.TOMLDecodeError:
+            parsed = None
+        expected = copy.deepcopy(old)
+        expected.setdefault("profile", {})["active"] = name
+        if parsed != expected:
+            # e.g. a "[profile]" line inside a multi-line string: the line edit
+            # would change something else. Don't guess - leave the file alone.
+            raise ValueError(f'couldn\'t safely update [profile] active in {path}; set it to "{name}" by hand')
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(new, encoding="utf-8", newline="")
         os.replace(tmp, path)
@@ -248,10 +361,11 @@ _ACTIVE = re.compile(r"""^(\s*active\s*=\s*)("[^"]*"|'[^']*'|[^\s#]+)(.*)$""")
 def _with_profile(text: str, name: str) -> str:
     """*text* with ``[profile] active`` set to *name*; nothing else changes."""
     lines = text.splitlines(keepends=True)
+    eol = "\r\n" if "\r\n" in text else "\n"  # the file's own line ending
     header = next((i for i, line in enumerate(lines) if (m := _SECTION.match(line)) and m.group(1).strip() == "profile"), None)
     if header is None:
-        sep = "" if not text or text.endswith("\n") else "\n"
-        return f'{text}{sep}\n[profile]\nactive = "{name}"\n'
+        sep = "" if not text or text.endswith("\n") else eol
+        return f'{text}{sep}{eol}[profile]{eol}active = "{name}"{eol}'
     for i in range(header + 1, len(lines)):
         if _SECTION.match(lines[i]):
             break
@@ -260,7 +374,7 @@ def _with_profile(text: str, name: str) -> str:
         if m:
             lines[i] = f'{m.group(1)}"{name}"{m.group(3)}{lines[i][len(body):]}'
             return "".join(lines)
-    newline = "\r\n" if lines[header].endswith("\r\n") else "\n"
+    newline = "\r\n" if lines[header].endswith("\r\n") else eol
     if not lines[header].endswith("\n"):
         lines[header] += newline
     lines.insert(header + 1, f'active = "{name}"{newline}')

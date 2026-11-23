@@ -15,8 +15,9 @@ from pathlib import Path
 
 from PIL import Image, PngImagePlugin
 
+from . import seal
 from .capture import Shot
-from .config import home
+from .config import Settings, home
 from .desktop import ArgusError
 from .imaging import View
 
@@ -98,10 +99,18 @@ class Store:
 _writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="argus-save")
 
 
+def png_info(image: Image.Image, data: dict) -> PngImagePlugin.PngInfo:
+    """PNG text chunks holding *data* and the seal that authenticates it."""
+    text = json.dumps(data)
+    info = PngImagePlugin.PngInfo()
+    info.add_text("argus", text)
+    info.add_text("argus-seal", seal.sign(text, image))
+    return info
+
+
 def write_png(image: Image.Image, path: Path, data: dict, compress_level: int = 1) -> None:
     """Write atomically, so nobody ever opens a half-written capture."""
-    info = PngImagePlugin.PngInfo()
-    info.add_text("argus", json.dumps(data))
+    info = png_info(image, data)
     tmp = path.with_name(path.name + ".part")
     image.save(tmp, format="PNG", compress_level=compress_level, pnginfo=info)
     os.replace(tmp, path)
@@ -117,6 +126,7 @@ def meta(shot: Shot) -> dict:
         "cursor": shot.cursor,
         "hidden": shot.hidden,
         "profile": shot.profile,
+        "policy": shot.policy,
     }
 
 
@@ -138,6 +148,11 @@ def open_file(path: str | Path) -> Shot:
             data = json.loads(info["argus"])
         except ValueError:
             data = {}
+    if not isinstance(data, dict):
+        data = {}
+    # Only a file Argus itself wrote (valid seal) keeps its policy stamp; without
+    # one the work profile won't show the image again (see `replayable`).
+    authentic = bool(data) and seal.verify(info["argus"], img, str(info.get("argus-seal") or ""))
     origin = tuple(data["origin"]) if data.get("origin") else None
     cursor = tuple(data["cursor"]) if data.get("cursor") else None
     return Shot(
@@ -152,4 +167,13 @@ def open_file(path: str | Path) -> Shot:
         taken=float(data.get("taken") or p.stat().st_mtime),
         source=p,
         profile=str(data.get("profile") or ""),
+        policy=str(data.get("policy") or "") if authentic else "",
     )
+
+
+def replayable(shot: Shot, s: Settings) -> bool:
+    """May *shot* be shown (again) under settings *s*? Always in the personal
+    profile. In the work profile only images Argus redacted under the current
+    work policy: not personal-profile captures, not captures from before the
+    allow/block lists changed, and not files without a valid seal."""
+    return not s.work or (shot.profile == "work" and bool(shot.policy) and shot.policy == s.policy)

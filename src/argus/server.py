@@ -20,6 +20,7 @@ from pydantic import Field
 from . import __version__, win32  # noqa: F401  (win32 first: DPI awareness)
 from .config import home, pretty_hotkey, settings
 from .desktop import ArgusError
+from .errors import describe_unexpected, scrub
 from .service import Result, Session, caption
 
 log = logging.getLogger("argus")
@@ -51,9 +52,13 @@ def _errors(fn):
 
     def explain(exc: Exception):
         if isinstance(exc, ToolError):
-            return exc
+            return ToolError(scrub(str(exc)))
         if isinstance(exc, ArgusError):
-            return ToolError(str(exc))
+            return ToolError(scrub(str(exc)))
+        # Work profile: a generic message + error id; the log gets no message.
+        message = describe_unexpected(exc, log, f"tool {fn.__name__}")
+        if message is not None:
+            return ToolError(message)
         log.exception("tool %s failed", fn.__name__)
         return ToolError(f"Argus hit an unexpected error ({type(exc).__name__}: {exc}). Details: {home() / 'logs' / 'server.log'}")
 

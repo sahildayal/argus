@@ -35,6 +35,12 @@ class StubSession:
             raise ArgusError("There is no monitor 9.")
         if monitor == "boom":
             raise RuntimeError("kaboom")
+        if monitor == "phi":
+            raise KeyError("Doe, John (MRN 123456) - Epic")
+        if monitor == "path":
+            from argus.config import home
+
+            raise ArgusError(f"No such file: {home() / 'captures' / '2026-11-01' / '120000_c1_doe-john-chart.png'}")
         return Result().add(self._cap())
 
     def list_screens(self):
@@ -106,3 +112,32 @@ def test_bad_arguments_are_rejected(stub):
 def test_list_screens_is_text_only(stub):
     r = call("list_screens")
     assert [c.type for c in r.content] == ["text"] and "Monitors" in r.content[0].text
+
+
+WORK = '[profile]\nactive = "work"\n[work]\nallow_apps = ["Code.exe"]\n'
+
+
+def _work_profile(argus_home):
+    from argus import config
+
+    argus_home.mkdir(parents=True, exist_ok=True)
+    config.config_path().write_text(WORK, encoding="utf-8")
+
+
+def test_work_profile_hides_unexpected_error_details(stub, argus_home, caplog):
+    _work_profile(argus_home)
+    r = call("screenshot", {"monitor": "phi"})
+    text = r.content[0].text
+    assert r.is_error and "error id" in text and "MRN" not in text and "Doe" not in text
+    assert "KeyError" in caplog.text and "MRN" not in caplog.text and "Doe" not in caplog.text
+
+
+def test_work_profile_scrubs_data_paths_from_errors(stub, argus_home):
+    _work_profile(argus_home)
+    r = call("screenshot", {"monitor": "path"})
+    assert r.is_error and "doe-john" not in r.content[0].text and "<Argus data folder>" in r.content[0].text
+
+
+def test_personal_profile_errors_are_unchanged(stub, argus_home):
+    r = call("screenshot", {"monitor": "path"})
+    assert r.is_error and "doe-john" in r.content[0].text

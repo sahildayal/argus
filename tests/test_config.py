@@ -27,7 +27,8 @@ def test_bad_values_are_reported_not_fatal():
     s = Settings.from_toml("this is = = not toml")
     assert s.problems and s.max_side == 2000
     s = Settings.from_toml("[privacy]\nredact_titles = ['(unclosed']\n")
-    assert any("bad regex" in p for p in s.problems)
+    assert any("redact_titles: entry 1 is not a valid regex" in p for p in s.problems)
+    assert not s.work  # a personal-profile mistake outside [profile] stays personal
 
 
 def test_partial_files_fall_back_to_defaults():
@@ -79,7 +80,7 @@ def test_old_config_files_without_the_new_sections_still_work():
 def test_bad_allow_regex_is_reported():
     s = Settings.from_toml('[profile]\nactive = "work"\n[work]\nallow_browser_titles = ["(oops"]\n')
     assert s.work and not s.allow_browser_titles
-    assert any("work.allow_browser_titles: bad regex" in p for p in s.problems)
+    assert any("work.allow_browser_titles: entry 1 is not a valid regex" in p for p in s.problems)
 
 
 def test_unknown_profile_fails_closed():
@@ -90,7 +91,9 @@ def test_unknown_profile_fails_closed():
 def test_broken_file_keeps_the_work_profile():
     s = Settings.from_toml('[profile]\nactive = "work"\n[work\nallow_apps = [\n')
     assert s.work and not s.allow_apps and s.problems
-    assert not Settings.from_toml("not = = toml").work
+    # Any file that doesn't parse fails closed, whatever profile it meant.
+    s = Settings.from_toml("not = = toml")
+    assert s.work and not s.allow_apps and not s.allow_snip_folder and "work profile with nothing allowed" in s.problems[0]
 
 
 def test_set_profile_edits_only_that_line(argus_home):

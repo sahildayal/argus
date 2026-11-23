@@ -3,7 +3,6 @@ for the screen to change, settle, or show some text."""
 
 from __future__ import annotations
 
-import json
 import math
 import re
 import time
@@ -12,13 +11,14 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, PngImagePlugin
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 from .capture import Shot
 from .config import home
-from .desktop import ArgusError, Paused
+from .config import Settings
+from .desktop import ArgusError, Paused, PolicyChanged
 from .geometry import Rect
-from .store import meta, open_file
+from .store import meta, open_file, png_info, replayable
 
 # ---------------------------------------------------------------------- diff
 
@@ -141,31 +141,42 @@ def save_baseline(name: str, shot: Shot) -> Path:
     if not shot.target:
         raise ArgusError("Only monitor, window or region captures can be baselines (they get re-captured to compare).")
     path = _baseline_path(name)
-    info = PngImagePlugin.PngInfo()
-    info.add_text("argus", json.dumps({**meta(shot), "baseline": name}))
+    info = png_info(shot.image, {**meta(shot), "baseline": name})
     shot.image.save(path, format="PNG", compress_level=6, pnginfo=info)
     return path
 
 
-def load_baseline(name: str) -> Shot:
+def load_baseline(name: str, s: Settings | None = None) -> Shot:
     path = _baseline_path(name)
     if not path.exists():
-        names = ", ".join(n for n, *_ in list_baselines()) or "none yet"
-        raise ArgusError(f"No baseline named {name!r}. Saved baselines: {names}.")
+        rows, hidden = baselines(s)
+        names = ", ".join(n for n, *_ in rows) or "none yet"
+        more = f" ({hidden} more hidden: not saved under the current work profile)" if hidden else ""
+        raise ArgusError(f"No baseline named {name!r}. Saved baselines: {names}{more}.")
     shot = open_file(path)
     shot.kind = "baseline"
     return shot
 
 
 def list_baselines() -> list[tuple[str, Path, float, str]]:
-    out = []
+    return baselines()[0]
+
+
+def baselines(s: Settings | None = None) -> tuple[list[tuple[str, Path, float, str]], int]:
+    """(name, path, taken, label) of each baseline, and how many were left out:
+    in the work profile, those not saved under its current policy - their
+    names and labels could describe what the profile now hides."""
+    out, hidden = [], 0
     for p in sorted(baselines_dir().glob("*.png")):
         try:
             shot = open_file(p)
-            out.append((p.stem, p, shot.taken, shot.label))
         except ArgusError:
             continue
-    return out
+        if s is not None and not replayable(shot, s):
+            hidden += 1
+            continue
+        out.append((p.stem, p, shot.taken, shot.label))
+    return out, hidden
 
 
 def delete_baseline(name: str) -> bool:
@@ -222,6 +233,8 @@ async def wait_for(
 
     try:
         first = await grab()
+    except PolicyChanged:
+        raise
     except ArgusError as exc:
         raise ArgusError(f"Can't start waiting: {exc}") from None
     last = first
@@ -266,7 +279,7 @@ async def wait_for(
         previous = last
         try:
             last = await grab()
-        except Paused:
+        except (Paused, PolicyChanged):
             raise
         except ArgusError as exc:
             gone = f"the target went away ({exc})"
@@ -283,7 +296,7 @@ async def _settle(grab, shot: Shot, sleep, min_change: float, settle: float = 0.
         await sleep(0.2)
         try:
             nxt = await grab()
-        except Paused:
+        except (Paused, PolicyChanged):
             raise
         except ArgusError:
             return current
