@@ -32,9 +32,11 @@ All of them end with the same two commands: `argus install` and `argus doctor`.
 
 - Windows 10 (1903+) or 11, **64-bit x86**. The wheelhouse contains `win_amd64` wheels only.
 - **Python 3.12 or 3.13 that is already installed**, from python.org, winget, or your
-  IT-managed software center. Not the Microsoft Store build, see below. The tray app uses
-  `tkinter` (for the brief outline it flashes on a marked window), so the installer must
-  include it: `python -c "import tkinter"` should print nothing.
+  IT-managed software center. Not the Microsoft Store build, see below. The tray app
+  **requires** `tkinter`: it draws the approval preview with it (in the work profile every
+  share needs that approval, so without tkinter every capture is refused), as well as the
+  brief outline it flashes on a marked window. The installer must include it:
+  `python -c "import tkinter"` should print nothing.
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/) (a single `uv.exe`).
   Without it, use the pip route.
 - At least one MCP-capable AI tool (see the README for the list `argus install` knows).
@@ -245,8 +247,49 @@ warning. Don't put the venv or `UV_TOOL_DIR` under `%TEMP%`, and don't register 
 
 On a managed machine, preview with `argus install --dry-run`, limit it with
 `--clients claude-code,vscode`, and skip the startup entry and tray with `--no-startup`.
-`argus uninstall` reverses all of it, and `argus doctor` checks monitors, OCR, the tray and
-each registration.
+`argus uninstall` reverses all of it.
+
+### What `argus doctor` checks
+
+`argus doctor` only reads; it changes nothing. It prints:
+
+- the DPI awareness mode and every monitor Argus sees;
+- whether Windows OCR is available, and in which languages;
+- whether captures are paused, and the data folder;
+- the Screenshots folder `latest_snip` reads;
+- the active profile and why (for example "the work profile was switched on and stays on");
+- whether the Startup shortcut exists;
+- whether the approval gate and the audit log are on (both always are in the work profile);
+- whether the tray process is running, and whether its approval pipe is reachable and
+  verified, i.e. owned by an `argus-tray` from this same install, run by this user in this
+  Windows session. When approvals are needed but unavailable it says how to fix it;
+- every problem in `config.toml`;
+- for each AI tool it detects, whether the Argus registration is present and points at a
+  working `argus-mcp`.
+
+`argus status` prints the same profile, gate, audit, tray and config lines without the
+monitor, OCR and registration checks.
+
+### Manual verification checklist
+
+After rolling Argus out to a machine, check it end to end once:
+
+1. Install with `uv tool install` (one of the routes above), then `argus install`.
+2. Confirm `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Argus.lnk` exists and
+   the tray icon is in the notification area (sign out and back in to check it starts with
+   Windows).
+3. `argus profile work`, then `argus allow --learn` (or `argus allow add <app>.exe`) to
+   allow one test app.
+4. `argus doctor`: no config problems, approval gate and audit log on, tray running,
+   approval pipe reachable and verified, the AI tool's registration OK.
+5. From the AI tool, ask it to look at the screen (the `look` tool). The tray preview
+   appears; check that only the allowed app is visible and everything else is black, then
+   click **Send**. Ask again and click **Deny**: the AI must be told the user declined, and
+   no new file may appear under `%USERPROFILE%\.argus\captures`.
+6. `argus audit` shows both decisions (`sent` / `denied`, with the client and app names
+   only), and `argus audit verify` reports a valid chain.
+7. Optional: quit the tray and ask again. The request must be refused ("Approval is
+   unavailable"), and `argus status` must say approvals are unavailable.
 
 ## Network access
 
@@ -276,14 +319,22 @@ Argus's own data is under `%USERPROFILE%\.argus` (or the folder in `ARGUS_HOME`)
 | Path | Contents |
 | --- | --- |
 | `config.toml` | Settings, created with comments on first run |
-| `captures\<date>\*.png` | Every capture that was sent to an AI tool, full resolution, after privacy redaction, with metadata embedded |
+| `config.toml.lock` | Empty lock file that `argus allow` and `argus profile` hold while editing `config.toml`, so two edits can't interleave |
+| `profile.state` | `work` or `personal`: remembers that the work profile was switched on, so a deleted or mangled `config.toml` can't turn it off |
+| `seal.key` | 32 random bytes that seal captures, marks and baselines to this install; deleting it invalidates every earlier seal |
+| `captures\<date>\*.png` | Captures that were sent to an AI tool, full resolution, after privacy redaction, with metadata embedded. When approval is on (always in the work profile) only approved captures are written; denied or timed-out ones never reach the disk |
 | `marks\<id>.json`, `<id>.window.png`, `<id>.monitor.png` | Tray hotkey marks |
-| `baselines\*.png` | Visual-regression baselines (`argus baseline save`) |
+| `baselines\*.png` | Visual-regression baselines, saved only on an explicit `save_baseline` / `argus baseline save` |
+| `audit\audit-YYYY-MM.jsonl` | Audit log of approval decisions, one JSON line each, hash-chained. No titles, OCR text, paths or pixels (see the README) |
+| `audit\head.json` | A record of the newest audit entry, so `argus audit verify` notices a truncated tail (accidental loss; it doesn't stop someone who can write files as the user) |
+| `audit\anchor.json` | Where retention pruning cut the chain (written when old months are deleted) |
+| `audit\.lock` | Lock file for concurrent audit writers |
 | `logs\server.log`, `logs\tray.log` | Rotating logs (1 MB x 2 backups and 500 KB x 1) |
-| `paused.json` | Present while Argus is paused |
+| `paused.json`, `gate-pause` | Present while Argus is paused; `gate-pause` is touched on every pause/resume so the tray notices even a quick one |
 
 Captures and marks are deleted after 7 days by default (`retention_days` under
-`[privacy]`); baselines are kept until you delete them. The images are screenshots, so
+`[privacy]`); baselines are kept until you delete them. Audit files are kept for 12
+months (`retention_months` under `[audit]`) and are not removed by `argus cleanup --all`. The images are screenshots, so
 treat the folder with the same care as the screens themselves, and note that the
 redaction lists in `config.toml` are what keep passwords and messaging windows out of
 them. `argus uninstall --purge` deletes the folder.
@@ -292,7 +343,12 @@ Outside that folder:
 
 - the uv tool environment and shims (above), or the venv you made;
 - the AI tool configs and Startup shortcut that `argus install` changes (above);
-- a named mutex `Local\ArgusTray` while the tray runs (single instance).
+- a named mutex `Local\ArgusTray` while the tray runs (single instance). With `ARGUS_HOME`
+  set to another folder the name is `Local\ArgusTray-<SHA-256 of that folder's path>`, so
+  trays for different data folders don't block each other;
+- a per-user named pipe `\\.\pipe\ArgusApproval-v2-<SHA-256 of user SID, session and data
+  folder>` while the tray runs, which carries approval previews from `argus-mcp` and the CLI
+  to the tray (see below).
 
 Argus **reads**, but does not write, your Windows Screenshots folder (usually
 `Pictures\Screenshots`, resolved through the Known Folder API) and images on the
@@ -315,7 +371,10 @@ function, not a side effect.
 | Global hotkeys | `RegisterHotKey` / `UnregisterHotKey` (Ctrl+Alt+S, Ctrl+Alt+P by default, configurable). This registers hotkeys; it does **not** install a keyboard hook and doesn't log keystrokes | `argus-tray` |
 | Tray icon and overlay | `Shell_NotifyIcon` via `pystray`; brief click-through, topmost, layered `tkinter` windows (`WS_EX_LAYERED \| WS_EX_TRANSPARENT \| WS_EX_NOACTIVATE \| WS_EX_TOOLWINDOW`) that outline a marked window | `argus-tray` |
 | OCR | `Windows.Media.Ocr` through the `winrt-*` packages | MCP server, CLI |
-| Single instance | named mutex `Local\ArgusTray` | `argus-tray` |
+| Approval pipe server | `CreateNamedPipeW` (local only, a protected DACL with one ACE for the user's SID built with `ConvertStringSecurityDescriptorToSecurityDescriptorW`, overlapped I/O, at most 16 clients) | `argus-tray` |
+| Approval pipe client and server check | `CreateFileW` on the pipe with identification-level impersonation only; `GetNamedPipeServerProcessId`, `ProcessIdToSessionId`, `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`, then `OpenProcessToken(TOKEN_QUERY)` + `GetTokenInformation(TokenUser)` + `ConvertSidToStringSidW` to confirm the pipe's server is an `argus-tray` of this install, run by the same user in the same session, before anything is sent | `argus-mcp`, `argus` (capture commands, `status`, `doctor`) |
+| Approval preview window | `tkinter` window; `SetPropW` tags it so Argus never lists or renders its own preview (desktop.py skips windows with that property), and `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` keeps it out of screen captures (including other screen-capture software) | `argus-tray` |
+| Single instance | named mutex `Local\ArgusTray` (hashed name when `ARGUS_HOME` is set) | `argus-tray` |
 | DPI awareness | `SetProcessDpiAwarenessContext` (per-monitor v2) | all |
 
 Not used: `SetWindowsHookEx` or any keyboard/mouse hook, `SendInput` or other input
@@ -325,7 +384,14 @@ a `.lnk` in the per-user Startup folder), or any network call.
 Child processes are spawned only by `argus install` / `argus uninstall`: `powershell`
 to create the Startup shortcut, each AI tool's own CLI (`claude`, `codex`, `gemini`,
 `agy`), and `taskkill` to stop the tray; and by `argus install` to start `argus-tray.exe`.
-The tray opens its captures, marks and settings folders with `os.startfile`.
+The tray opens its captures, marks and audit log folders and the settings file with
+`os.startfile`.
+
+The approval pipe is the only inter-process channel Argus opens. It is local to the
+machine (remote clients are rejected), restricted to the signed-in user, scoped to their
+Windows session and data folder, and the client verifies the server process before sending
+a preview. It is not a sandbox against other code running as the same user, which could
+tamper with the tray, its files or its input.
 
 Executables in a standard install: `argus.exe` (CLI), `argus-mcp.exe` (MCP stdio server,
 started by the AI tool), `argus-tray.exe` (windowless tray app). Each is a launcher for the
