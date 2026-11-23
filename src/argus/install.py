@@ -321,6 +321,13 @@ def is_temporary(path: str) -> bool:
     return "\\uv\\cache\\" in p or "\\appdata\\local\\temp\\" in p
 
 
+def is_store_python(prefix: str) -> bool:
+    """True for the Microsoft Store build of Python (pass ``sys.base_prefix``, which
+    stays the Store install folder inside a venv). Windows runs it with its writes under
+    %APPDATA% redirected into a private per-package folder."""
+    return "\\windowsapps\\pythonsoftwarefoundation.python" in prefix.lower().replace("/", "\\")
+
+
 def install(args) -> int:
     server = entry_point("argus-mcp")
     if is_temporary(server):
@@ -328,11 +335,19 @@ def install(args) -> int:
             f"argus-mcp is running from a temporary location ({server}), probably through uvx. AI tools "
             "registered to it would break when uv cleans its cache. Install Argus permanently first:\n"
             "  uv tool install argus-screens --managed-python --python 3.13\n"
+            "(no Python download allowed on this machine? See docs/enterprise-install.md for an installed-Python route)\n"
             "and then run `argus install` again."
         )
         if not args.dry_run:
             raise ArgusError(message)
         print(f"WARNING: {message}\n")
+    if is_store_python(sys.base_prefix):
+        print(
+            "WARNING: Argus is running on the Microsoft Store build of Python. Windows redirects that Python's "
+            "writes under AppData into a private folder, so the edits to Claude Desktop's and VS Code's config "
+            "files would not reach those apps. Reinstall Argus on a Python from python.org, winget or uv "
+            "(docs/enterprise-install.md), then run `argus install` again.\n"
+        )
     allow = args.trust  # default: each AI tool keeps asking before a capture
     print(f"Argus MCP server: {server}")
     failures = 0

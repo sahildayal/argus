@@ -1,7 +1,15 @@
 import pytest
 
 from argus.desktop import ArgusError
-from argus.install import _load_jsonc, is_temporary
+from argus.install import _load_jsonc, is_store_python, is_temporary
+
+
+def test_store_python_is_recognised_by_its_install_folder():
+    store = r"C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0"
+    assert is_store_python(store)
+    assert is_store_python(store.replace("\\", "/").lower())
+    assert not is_store_python(r"C:\Users\a\AppData\Local\Programs\Python\Python313")
+    assert not is_store_python(r"C:\Users\a\AppData\Roaming\uv\python\cpython-3.13.15-windows-x86_64-none")
 
 
 def test_temporary_install_locations_are_refused():

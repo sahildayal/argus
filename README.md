@@ -77,6 +77,11 @@ server that runs `argus-mcp`. Use the full path, which `where.exe argus-mcp` pri
 > Store Python silently redirects writes under `AppData` into a private sandbox, so
 > edits to other apps' configs would never reach them.
 
+**Locked-down or offline machine?** Argus can run on an already-installed Python 3.12+
+(python.org or winget, not the Store build), from pinned dependency versions, or from an
+offline wheelhouse with checksums, and the guide lists what it writes to disk and which
+Windows APIs it uses, for IT review: [docs/enterprise-install.md](https://github.com/sahildayal/argus/blob/main/docs/enterprise-install.md).
+
 ## How "the window I'm looking at" works
 
 When you type into a terminal or IDE, *that* window has focus, so it can't be
