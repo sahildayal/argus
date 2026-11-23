@@ -24,6 +24,7 @@ from .config import config_path, home, parse_hotkey, pretty_hotkey, set_profile,
 from .desktop import NO_HOST, ArgusError, set_host, snapshot
 from .gate_pipe import PipeServer
 from .gate_ui import Approvals
+from .errors import log_unexpected
 from .geometry import Rect
 from .marks import marks_dir, save_mark
 
@@ -99,10 +100,13 @@ class TrayApp:
     def _title(self) -> str:
         s = settings()
         state = privacy.pause_state().describe()
-        return (
+        title = (
             f"Argus: {state}, {s.profile} profile\n"
             f"Mark: {pretty_hotkey(s.hotkey_mark)} | Pause: {pretty_hotkey(s.hotkey_pause)}"
         )
+        if s.problems:
+            title += f"\nConfig problem ({len(s.problems)}): see `argus status`"
+        return title[:127]  # the notification-area tooltip limit
 
     def _menu(self) -> pystray.Menu:
         s = settings()
@@ -181,8 +185,8 @@ class TrayApp:
             if time.time() - self._last_cleanup > 3600:
                 self._last_cleanup = time.time()
                 privacy.cleanup(settings(), force=True)
-        except Exception:
-            log.exception("tick failed")
+        except Exception as exc:
+            log_unexpected(log, exc, "tick")
         self.root.after(1000, self._tick)
 
     def _handle(self, action: str, arg) -> None:
@@ -208,8 +212,8 @@ class TrayApp:
                 self.hotkeys.stop()
                 self.icon.stop()
                 self.root.quit()
-        except Exception:
-            log.exception("action %s failed", action)
+        except Exception as exc:
+            log_unexpected(log, exc, f"action {action}")  # work profile: type + error id only
             self.pill(f"Argus: {action} failed (see logs)", WARN)
 
     # -- actions -------------------------------------------------------------------

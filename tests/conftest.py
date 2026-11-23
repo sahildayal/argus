@@ -44,13 +44,17 @@ def mon(index, x, y, w, h, *, position="", primary=False, builtin=False, model="
     return Monitor(index, f"\\\\.\\DISPLAY{index}", model, builtin, primary, Rect(x, y, w, h), Rect(x, y, w, h - 40), dpi, position)
 
 
+def desk(monitors, layers, *, cursor=(10, 10), fg=0, under=0, host: Host = NO_HOST, taken=1000.0, refresh=None) -> Desktop:
+    """A fake desktop. Re-snapshotting it (work-profile captures do) returns the
+    same desktop unless *refresh* says otherwise."""
+    d = Desktop(tuple(monitors), tuple(layers), cursor, fg, under, host, taken)
+    object.__setattr__(d, "refresh", refresh or (lambda: d))
+    return d
+
+
 def win(hwnd, title, *, app="App", process="app.exe", pid=None, rect=Rect(0, 0, 800, 600), z=0, minimized=False,
         is_app=True, see_through=False, owner=0, monitor=1, host=False, cls="AppWindow", topmost=False,
-        maximized=False) -> Window:
+        maximized=False, **extra) -> Window:
     return Window(hwnd=hwnd, title=title, cls=cls, pid=pid or hwnd, process=process, app=app, rect=rect, z=z,
                   minimized=minimized, maximized=maximized, topmost=topmost, see_through=see_through, is_app=is_app,
-                  owner=owner, monitor=monitor, host=host)
-
-
-def desk(monitors, layers, *, cursor=(10, 10), fg=0, under=0, host: Host = NO_HOST, taken=1000.0) -> Desktop:
-    return Desktop(tuple(monitors), tuple(layers), cursor, fg, under, host, taken)
+                  owner=owner, monitor=monitor, host=host, **extra)

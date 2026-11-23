@@ -24,6 +24,7 @@ from . import gate
 from .capture import Shot
 from .config import home, pretty_hotkey, settings
 from .desktop import ArgusError, Paused
+from .errors import describe_unexpected, scrub
 from .imaging import render
 from .service import Result, Session, caption
 
@@ -97,11 +98,16 @@ def _errors(fn):
 
     def explain(exc: Exception, start: gate.Policy | None):
         if isinstance(exc, ToolError):
-            return exc
+            return ToolError(scrub(str(exc)))
         if isinstance(exc, ArgusError):
+            text = scrub(str(exc))
             if start is not None and not isinstance(exc, Paused):
-                gate.require(gate.request(fn.__name__, text=(str(exc),), start=start, allow_trust=False))
-            return ToolError(str(exc))
+                gate.require(gate.request(fn.__name__, text=(text,), start=start, allow_trust=False))
+            return ToolError(text)
+        # Work profile: a generic message + error id; the log gets no message.
+        message = describe_unexpected(exc, log, f"tool {fn.__name__}")
+        if message is not None:
+            return ToolError(message)
         log.exception("tool %s failed", fn.__name__)
         if start is None or start.enabled:
             return ToolError("Argus hit an unexpected error. Check the Argus server log.")

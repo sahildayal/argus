@@ -175,10 +175,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return _run(args) or 0
     except ArgusError as exc:
-        print(f"argus: {exc}", file=sys.stderr)
+        from .errors import scrub
+
+        print(f"argus: {scrub(str(exc))}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         return 130
+    except Exception as exc:
+        from .errors import describe_unexpected
+
+        message = describe_unexpected(exc)
+        if message is None:
+            raise
+        print(f"argus: {message}", file=sys.stderr)
+        return 1
 
 
 def _run(args) -> int | None:
@@ -272,13 +282,20 @@ def _baseline(session, args) -> int:
         first = next((p for p in result.parts if isinstance(p, str)), "")
         return 0 if first.startswith("No visible change") else 1
     elif args.action == "list":
-        rows = testing.list_baselines()
-        if not rows:
+        import time
+
+        from .config import settings
+
+        s = settings()
+        # Work profile: baselines from the personal profile or an older policy
+        # are only counted - their names and labels may describe hidden things.
+        rows, hidden = testing.baselines(s if s.work else None)
+        if not rows and not hidden:
             print("No baselines yet.")
         for name, path, taken, label in rows:
-            import time
-
             print(f"{name:24} {time.strftime('%Y-%m-%d %H:%M', time.localtime(taken))}  {label}  ({path})")
+        if hidden:
+            print(f"{hidden} hidden baseline(s): not saved under the current work profile.")
     elif args.action == "delete":
         print("Deleted." if testing.delete_baseline(args.name) else f"No baseline named {args.name!r}.")
     return 0
@@ -326,6 +343,9 @@ def _profile_cmd(args) -> int:
         print(f"Allowed browser-tab patterns: {', '.join(p.pattern for p in s.allow_browser_titles) or 'none'}")
         if s.allow_titles:
             print(f"Allowed title patterns: {', '.join(p.pattern for p in s.allow_titles)}")
+        if s.allow_browser_titles or s.allow_titles:
+            print("Note: title patterns match titles that pages/programs set themselves - a convenience, not a security "
+                  "boundary. For strict control, allow a dedicated browser by exe name instead.")
         if not (s.allow_apps or s.allow_browser_titles or s.allow_titles):
             print(f"Nothing is allowed yet, so captures will be fully black. Add apps under [work] in {config.config_path()}.")
     else:

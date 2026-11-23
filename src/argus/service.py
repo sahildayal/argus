@@ -13,14 +13,14 @@ import anyio
 from . import ocr, privacy, testing
 from .capture import Shot, capture, capture_monitor, capture_window, recapture
 from .config import Settings, config_path, home, pretty_hotkey, settings
-from .desktop import ArgusError, Desktop, Host, Window, detect_host, snapshot
+from .desktop import ArgusError, Desktop, Host, PolicyChanged, Window, detect_host, snapshot
 from .focus import Tracker
 from .geometry import Rect
 from .imaging import render, side_by_side
 from .looking import ago, choose, host_label
 from .marks import recent_marks
 from .snips import latest as latest_snips, screenshots_dir
-from .store import Capture, Store, open_file
+from .store import Capture, Store, open_file, replayable
 
 
 @dataclass
@@ -78,17 +78,29 @@ def _looks_like_path(ref: str) -> bool:
 
 
 def _profile_ok(shot: Shot, s: Settings) -> bool:
-    """In the work profile, only images Argus redacted under the work profile may
-    be shown again (not captures, marks or baselines from the personal profile,
-    nor arbitrary image files)."""
-    return not s.work or shot.profile == "work"
+    """In the work profile, only images Argus redacted under the current work
+    policy may be shown again (see store.replayable)."""
+    return replayable(shot, s)
 
 
 def _require_profile(shot: Shot, s: Settings) -> None:
     if not _profile_ok(shot, s):
         raise ArgusError(
-            "The user's work profile is on, and that image wasn't taken under it (it's from the personal profile, "
-            "or isn't an Argus capture), so Argus won't show it. Take a fresh capture instead."
+            "The user's work profile is on, and that image wasn't taken under its current settings (it's from the "
+            "personal profile, from before the allowed apps changed, or isn't a capture Argus can vouch for), so Argus "
+            "won't show it. Take a fresh capture instead."
+        )
+
+
+def _same_policy(s: Settings) -> None:
+    """End a multi-frame call if the profile or its allow/block lists changed
+    since it started: frames redacted under the old rules must not go out.
+    Only matters when the work profile is involved, before or after."""
+    now = settings()
+    if now.policy != s.policy and (s.work or now.work):
+        raise PolicyChanged(
+            "The user changed Argus's privacy profile or its allowed apps while this was running, so Argus stopped and "
+            "discarded what it had captured. Start again if it's still needed."
         )
 
 
@@ -179,12 +191,14 @@ class Session:
             return privacy.display_name(w, s)
 
         history = self.history()
-        choice = choose(desk, history, (lambda w: privacy.allowed(w, s)) if s.work else None)
+        # Work profile: only windows it actually shows (allowed and not on the
+        # block list) can be picked or offered as alternatives.
+        choice = choose(desk, history, (lambda w: privacy.shown(w, s)) if s.work else None)
         footer = []
         notice = ""
         if s.work:
             likely = choose(desk, history).window
-            if likely is not None and not privacy.allowed(likely, s):
+            if likely is not None and not privacy.shown(likely, s):
                 notice = (
                     f"The window the user was most likely looking at, {name(likely)}, isn't allowed by their work "
                     "profile, so Argus won't show it."
@@ -283,6 +297,7 @@ class Session:
             taken=cap.shot.taken,
             profile=cap.shot.profile,
             share_windows=cap.shot.share_windows,
+            policy=cap.shot.policy,
         )
         return Result(sources=[cap]).add(self.register(shot, grid=grid, upscale_to=1200))
 
@@ -378,7 +393,7 @@ class Session:
             what = f"saved snip {sn.path.name}" if sn.path else "image on the clipboard"
             shots.append(
                 Shot(image=sn.image, kind="snip", label=f"{what}, from {when}", origin=None, target={}, method=sn.source,
-                     taken=sn.when or time.time(), source=sn.path, profile=s.profile)
+                     taken=sn.when or time.time(), source=sn.path, profile=s.profile, policy=s.policy)
             )
         result = Result()
         if len(shots) > 1:
@@ -399,7 +414,8 @@ class Session:
             raise ArgusError("The latest mark's image files are missing (cleaned up or deleted).")
         if not _profile_ok(shot, s):
             raise ArgusError(
-                "The latest mark was made before the user's work profile was turned on, so Argus won't share it. "
+                "The latest mark wasn't made under the user's current work profile settings (it predates switching to "
+                "work or changing the allowed apps), so Argus won't share it. "
                 f"They can mark again with {pretty_hotkey(s.hotkey_mark)}."
             )
         if not self.defer_marks:
@@ -468,8 +484,8 @@ class Session:
         crop = Shot(
             image=img.crop((bx0, by0, bx1, by1)), kind="zoom", label=f'best match for "{text}" (from {cap.id})',
             origin=origin, target={}, method="crop", cursor=cap.shot.cursor, taken=cap.shot.taken,
-            profile=cap.shot.profile,
             share_windows=cap.shot.share_windows,
+            profile=cap.shot.profile, policy=cap.shot.policy,
         )
         box = (best.box[0] - bx0, best.box[1] - by0, best.box[2] - bx0, best.box[3] - by0)
         return result.text(*lines).add(self.register(crop, grid=False, boxes=[box], upscale_to=900))
@@ -497,7 +513,7 @@ class Session:
                 ignore=None, threshold: int = 24, show: str = "after") -> Result:
         s = self.guard()
         if baseline:
-            before = testing.load_baseline(baseline)
+            before = testing.load_baseline(baseline, s)
             _require_profile(before, s)
             after = recapture(self.desk(), s, before.target)
             name_before = f"baseline {baseline!r} (saved {ago(time.time() - before.taken)} ago)"
@@ -520,6 +536,7 @@ class Session:
             except (TypeError, ValueError):
                 raise ArgusError("ignore takes a list of [x, y, width, height] boxes") from None
         d = testing.diff(before.image, after.image, threshold=max(0, min(int(threshold), 255)), ignore=rects)
+        _same_policy(s)
         result = Result(evidence=[before, after])
         if d.changed == 0:
             cap = self.register(after, grid=False)
@@ -537,7 +554,8 @@ class Session:
             if before.share_windows is not None and after.share_windows is not None:
                 scope = before.share_windows | after.share_windows
             shot = Shot(image=combo, kind="compare", label=f"{name_before} vs now", origin=None, target={}, method="composite",
-                        profile=after.profile, share_windows=scope)
+                        profile=after.profile, share_windows=scope,
+                        policy=after.policy if before.policy == after.policy else "")
             cap = self.register(shot, grid=False)
             sc, cs = right_view.scale, cap.view.scale
             ox, oy = left.width + 12, 26
@@ -569,6 +587,9 @@ class Session:
         async def grab() -> Shot:
             nonlocal approval_time
             privacy.ensure_not_paused()
+            # Every frame re-checks the profile: if it (or its lists) changed,
+            # the frames taken so far are dropped and the wait ends.
+            _same_policy(s)
             if pending:
                 shot = pending.pop()
             else:
@@ -592,6 +613,7 @@ class Session:
             grab, until, text=text, read=ocr.read, find=ocr.find, timeout=timeout, progress=report,
             clock=lambda: time.monotonic() - approval_time,
         )
+        _same_policy(s)  # the last frame may predate a switch made during OCR / settling
         boxes = None
         if outcome.matches:
             boxes = [m.box for m in outcome.matches[:5]]
@@ -616,5 +638,6 @@ def status_text() -> str:
             f"Settings: {config_path()}",
             f"Hotkeys: mark {pretty_hotkey(s.hotkey_mark)}, pause {pretty_hotkey(s.hotkey_pause)} (tray app)",
             f"Captures are deleted after {s.retention_days:g} days.",
+            *(f"Config problem: {p}" for p in s.problems),
         ]
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,6 +35,7 @@ class Shot:
     source: Path | None = None  # the file a snip/mark came from
     profile: str = ""  # privacy profile it was taken under ("" = unknown, e.g. any image file)
     share_windows: WindowSet | None = None  # live provenance, never loaded from a PNG
+    policy: str = ""  # Settings.policy it was redacted under ("" = unknown or not authenticated)
 
     @property
     def cursor_in_image(self) -> tuple[int, int] | None:
@@ -58,20 +60,88 @@ def grab(rect: Rect) -> Image.Image:
     return Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
 
 
+# ---------------------------------------------------------- work-profile grabs
+
+GRAB_ATTEMPTS = 3  # the first try plus two retries
+
+
+class ScreenChanged(ArgusError):
+    """The desktop kept changing while a work-profile capture was being taken."""
+
+
+def _layout(desk: Desktop, area: Rect, s: Settings) -> tuple:
+    """Everything about *desk* that decides how *area* gets redacted in the work
+    profile: the monitors, the foreground window and, front to back, every window
+    that touches the area with its position, process, owner, transparency and
+    allow/block verdict (which covers title changes that matter)."""
+    windows = tuple(
+        (w.hwnd, w.rect, w.pid, w.app_pid, w.process.lower(), w.owner, w.cls, w.minimized, w.see_through, w.alpha,
+         w.rect_exact, w.attributed, w.is_app, shown(w, s), sensitive_reason(w, s) is not None)
+        for w in desk.layers
+        if w.minimized or w.rect.intersect(area)
+    )
+    monitors = tuple((m.device, m.rect, m.dpi) for m in desk.monitors)
+    # Processes with a hidden window anywhere decide whether their popups show.
+    hidden_pids = frozenset(w.app_process_id for w in desk.layers if w.is_app and not shown(w, s))
+    return monitors, desk.foreground, windows, hidden_pids
+
+
+def _grab_redacted(desk: Desktop, s: Settings, area_of: Callable[[Desktop], Rect]) -> tuple[Image.Image, Rect, list[str], Desktop]:
+    """Grab and redact the area *area_of(desk)*. Returns (image, area, hidden, the
+    desktop it was redacted against).
+
+    In the work profile the window list is read again right after the grab; if
+    anything that decides the redaction changed in between (a window opened,
+    moved, changed z-order, title or focus), the grab is retried, and after
+    GRAB_ATTEMPTS the capture is refused rather than risking a stale mask. A
+    window that appears and vanishes entirely between two snapshots can still
+    slip through - the confirm step is the backstop for that."""
+    if not s.work:
+        area = area_of(desk)
+        img = grab(area)
+        return img, area, redact(img, (area.x, area.y), desk, s), desk
+    if not win32.dpi_ok():
+        raise ArgusError(
+            f"Argus couldn't make itself per-monitor DPI aware (it got {win32.DPI_AWARENESS!r}), so window positions "
+            "may be scaled and the work profile can't redact reliably. Nothing was captured. Tell the user; restarting "
+            "the AI tool usually fixes it."
+        )
+    if desk.refresh is None:
+        raise ArgusError("This desktop snapshot can't be re-checked, so the work profile won't capture from it.")
+    before = desk
+    for _ in range(GRAB_ATTEMPTS):
+        area = area_of(before)
+        img = grab(area)
+        after = before.refresh()
+        if area_of(after) == area and _layout(before, area, s) == _layout(after, area, s):
+            return img, area, redact(img, (area.x, area.y), after, s), after
+        before = after
+    raise ScreenChanged(
+        "The screen kept changing while Argus was capturing it (windows opening, moving or switching), and the work "
+        "profile won't risk a capture that may not match what's on screen. Nothing was captured; try again in a moment."
+    )
+
+
 def capture_monitor(desk: Desktop, mon: Monitor, s: Settings) -> Shot:
-    img = grab(mon.rect)
-    hidden = redact(img, (mon.rect.x, mon.rect.y), desk, s)
+    def area_of(d: Desktop) -> Rect:
+        m = next((m for m in d.monitors if m.device == mon.device), None)
+        if m is None:
+            raise ArgusError(f"{mon.title} was disconnected while Argus was capturing it.")
+        return m.rect
+
+    img, area, hidden, desk = _grab_redacted(desk, s, area_of)
     return Shot(
         image=img,
         kind="monitor",
         label=f"{mon.title}, {mon.name}",
-        origin=(mon.rect.x, mon.rect.y),
+        origin=(area.x, area.y),
         target={"monitor": str(mon.index), "device": mon.device},
         hidden=hidden,
         cursor=desk.cursor,
         monitor=mon,
         profile=s.profile,
         share_windows=share_scope(desk, s) if s.requires_approval else None,
+        policy=s.policy,
     )
 
 
@@ -81,8 +151,7 @@ def capture_region(desk: Desktop, rect: Rect, s: Settings, label: str | None = N
     clipped = rect.intersect(desk.bounds)
     if clipped is None:
         raise ArgusError(f"Region {rect} is off every monitor. The desktop spans {desk.bounds}.")
-    img = grab(clipped)
-    hidden = redact(img, (clipped.x, clipped.y), desk, s)
+    img, _, hidden, desk = _grab_redacted(desk, s, lambda d: clipped)
     notes = [] if clipped == rect else [f"Clipped to the screen: {clipped}."]
     mon = desk.monitor_for(clipped)
     return Shot(
@@ -97,6 +166,7 @@ def capture_region(desk: Desktop, rect: Rect, s: Settings, label: str | None = N
         monitor=mon,
         profile=s.profile,
         share_windows=share_scope(desk, s) if s.requires_approval else None,
+        policy=s.policy,
     )
 
 
@@ -121,7 +191,7 @@ def render_window(win: Window) -> Image.Image | None:
     return None if _looks_blank(img) else img
 
 
-def capture_window(desk: Desktop, win: Window, s: Settings) -> Shot:
+def _refuse_window(win: Window, s: Settings) -> None:
     check_window(win, s)  # work profile: refuse rather than return a black image
     if win.minimized:
         raise ArgusError(
@@ -134,6 +204,10 @@ def capture_window(desk: Desktop, win: Window, s: Settings) -> Shot:
             f"That window ({reason}) is on the user's privacy list, so Argus won't capture it. "
             "The user can change the list in ~/.argus/config.toml."
         )
+
+
+def capture_window(desk: Desktop, win: Window, s: Settings) -> Shot:
+    _refuse_window(win, s)
     mon = desk.monitor(win.monitor) if win.monitor else None
     base = Shot(
         image=Image.new("RGB", (1, 1)),
@@ -146,16 +220,40 @@ def capture_window(desk: Desktop, win: Window, s: Settings) -> Shot:
         window=win,
         profile=s.profile,
         share_windows=share_scope(desk, s, [win]) if s.requires_approval else None,
+        policy=s.policy,
     )
     visible = desk.visible_fraction(win)
-    if visible >= 0.995:
-        area = win.rect
-        for popup in desk.same_app_popups(win):  # open menus spill past the frame
-            area = area.union(popup.rect)
-        area = area.intersect(desk.bounds) or win.rect
-        base.image = grab(area)
+
+    def area_of(d: Desktop) -> Rect:
+        """The window plus its open menus, on screen. In the work profile the
+        window is re-checked against every fresh snapshot too."""
+        w = d.window(win.hwnd)
+        if w is None:
+            raise ArgusError(f"{display_name(win, s)} closed while Argus was capturing it.")
+        _refuse_window(w, s)
+        full = w.rect
+        if s.work or visible >= 0.995:
+            for popup in d.same_app_popups(w):  # open menus spill past the frame
+                full = full.union(popup.rect)
+        area = full.intersect(d.bounds)
+        if area is None:
+            raise ArgusError(f"{display_name(win, s)} is entirely off-screen.")
+        return area
+
+    if visible >= 0.995 or s.work:
+        # The work profile never uses PrintWindow: an offscreen render shows the
+        # whole window, so whatever covers it would have to be trusted to be
+        # nothing. Covered parts are simply blacked out instead.
+        base.image, area, base.hidden, final = _grab_redacted(desk, s, area_of)
         base.origin = (area.x, area.y)
-        base.hidden = redact(base.image, base.origin, desk, s)
+        if s.requires_approval:  # trust what the pixels came from, not the first snapshot
+            base.share_windows = share_scope(final, s, [final.window(win.hwnd) or win])
+        if visible < 0.995:
+            covered = round((1 - visible) * 100)
+            base.notes.append(
+                f"About {covered}% of this window is covered by other windows or off-screen; the work profile blacks out "
+                "whatever covers it instead of rendering the window offscreen."
+            )
         return base
 
     rendered = render_window(win)
@@ -239,11 +337,17 @@ def recapture(desk: Desktop, s: Settings, target: dict) -> Shot:
     if "window" in target:
         win = desk.window(int(target["window"]))
         if win is None or not win.is_app:
-            # The app restarted: find the same program with the closest title.
-            candidates = [w for w in desk.windows if w.process.lower() == str(target.get("process", "")).lower()]
+            # The app restarted: find the same program with the closest title. In
+            # the work profile only windows it shows are candidates, so a hidden
+            # window's title is never compared (or picked).
+            candidates = [
+                w for w in desk.windows
+                if w.process.lower() == str(target.get("process", "")).lower() and (not s.work or shown(w, s))
+            ]
             if not candidates:
                 what = "That window" if s.work else f'The window "{target.get("title", "?")}"'
-                raise ArgusError(f"{what} is gone and no {target.get('process')} window is open.")
+                which = "allowed " if s.work else ""
+                raise ArgusError(f"{what} is gone and no {which}{target.get('process')} window is open.")
             title = str(target.get("title", ""))
             win = max(candidates, key=lambda w: (_similar(w.title, title), -w.z))
         return capture_window(desk, win, s)

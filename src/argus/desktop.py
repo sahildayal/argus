@@ -10,7 +10,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import PurePath
 
 import psutil
@@ -27,6 +27,10 @@ class ArgusError(Exception):
 
 class Paused(ArgusError):
     """The user has paused Argus; nothing may be captured."""
+
+
+class PolicyChanged(ArgusError):
+    """The privacy profile or its lists changed during a multi-frame call."""
 
 
 # ----------------------------------------------------------------- monitors
@@ -103,6 +107,20 @@ class Window:
     owner: int
     monitor: int | None  # display number holding most of the window
     host: bool = False  # the terminal/IDE this AI session runs in
+    alpha: int | None = None  # constant alpha of a layered window (LWA_ALPHA), None if it has none
+    rect_exact: bool = True  # False when the frame rect came from a fallback (may include borders)
+    app_pid: int = 0  # the hosted app's process for UWP frames (ApplicationFrameHost), else 0
+    attributed: bool = True  # False when the owning app couldn't be identified unambiguously
+
+    @property
+    def app_process_id(self) -> int:
+        """The process the window's content belongs to (the UWP app, not its frame host)."""
+        return self.app_pid or self.pid
+
+    @property
+    def transparent(self) -> bool:
+        """Provably invisible: a layered window with constant alpha 0."""
+        return self.alpha == 0
 
     @property
     def handle(self) -> str:
@@ -203,46 +221,61 @@ def set_host(host: Host) -> None:
 
 NO_HOST = Host(frozenset(), (), frozenset())
 
-# pid -> (time cached, exe name, exe path)
-_proc_cache: dict[int, tuple[float, str, str]] = {}
+# (pid, process start time) -> (time cached, exe name, exe path). Keyed by the
+# start time too, so a PID Windows reuses for another program is never mistaken
+# for the old one (the work profile allows windows by exe name).
+_proc_cache: dict[tuple[int, float], tuple[float, str, str]] = {}
 
 
 def _process(pid: int) -> tuple[str, str]:
-    hit = _proc_cache.get(pid)
+    """(exe name, exe path); ("", "") when the process can't be read (gone,
+    protected or elevated beyond reach) - the work profile never allows those."""
+    try:
+        p = psutil.Process(pid)
+        key = (pid, p.create_time())
+    except psutil.Error:
+        return "", ""
+    hit = _proc_cache.get(key)
     now = time.monotonic()
     if hit and now - hit[0] < 120:
         return hit[1], hit[2]
     name, exe = "", ""
     try:
-        p = psutil.Process(pid)
         name = p.name()
         try:
             exe = p.exe()
         except psutil.Error:
             exe = ""
     except psutil.Error:
-        pass
-    _proc_cache[pid] = (now, name, exe)
+        return "", ""
+    if len(_proc_cache) > 2048:
+        _proc_cache.clear()
+    _proc_cache[key] = (now, name, exe)
     return name, exe
 
 
-def _friendly_app(hwnd: int, pid: int, process: str, exe: str) -> tuple[str, str, int]:
-    """(process, app name, pid) - looking through ApplicationFrameHost to the real UWP app."""
+def _friendly_app(hwnd: int, pid: int, process: str, exe: str) -> tuple[str, str, int, bool]:
+    """(process, app name, pid, attributed) - looking through ApplicationFrameHost
+    to the real UWP app. *attributed* is False when a frame host's app can't be
+    pinned to exactly one process (the work profile then never allows it)."""
+    attributed = True
     if process.lower() == "applicationframehost.exe":
+        hosted = {}
         for child in win32.child_windows(hwnd):
             cpid = win32.window_pid(child)
-            if cpid and cpid != pid:
-                cname, cexe = _process(cpid)
-                if cname:
-                    process, exe, pid = cname, cexe, cpid
-                    break
+            if cpid and cpid != pid and cpid not in hosted:
+                hosted[cpid] = _process(cpid)
+        named = [(cpid, name, path) for cpid, (name, path) in hosted.items() if name]
+        attributed = len(hosted) == 1 and len(named) == 1
+        if named:  # the personal profile's block list still uses the first match
+            pid, process, exe = named[0]
     app = win32.file_description(exe) if exe else ""
     if process.lower() == "explorer.exe":
         app = "File Explorer"
     elif not app or app.lower() == "application frame host":
         app = PurePath(process).stem
     app = _APP_RENAMES.get(app, app)
-    return process, app, pid
+    return process, app, pid, attributed
 
 
 # File descriptions that read oddly as app names.
@@ -261,6 +294,9 @@ class Desktop:
     under_cursor: int
     host: Host
     taken: float
+    # Takes a new snapshot of the same desktop (the work profile checks that
+    # nothing moved while the pixels were grabbed). None for hand-made desktops.
+    refresh: Callable[[], Desktop] | None = field(default=None, compare=False, repr=False)
 
     @property
     def windows(self) -> list[Window]:
@@ -380,7 +416,7 @@ def snapshot(host: Host | None = None) -> Desktop:
         if not win32.IsWindowVisible(h) or win32.is_cloaked(h):
             continue
         minimized = bool(win32.IsIconic(h))
-        rect = win32.frame_rect(h)
+        rect, exact = win32.frame_rect_ex(h)
         if rect.empty and not minimized:
             continue
         ex = win32.ex_style(h)
@@ -400,17 +436,21 @@ def snapshot(host: Host | None = None) -> Desktop:
             and not (ex & win32.WS_EX_TOOLWINDOW and not ex & win32.WS_EX_APPWINDOW)
             and not (ex & win32.WS_EX_NOACTIVATE and not ex & win32.WS_EX_APPWINDOW)
         )
-        app = ""
+        app, app_pid, attributed = "", 0, True
         if is_app:
-            process, app, _app_pid = _friendly_app(h, pid, process, exe)
+            process, app, resolved, attributed = _friendly_app(h, pid, process, exe)
+            app_pid = resolved if resolved != pid else 0
+        elif process.lower() == "applicationframehost.exe":
+            attributed = False  # a frame host's popups can't be tied to one app
         mon = None if minimized else _monitor_for(monitors, rect)
         w = Window(
             hwnd=h, title=title, cls=cls, pid=pid, process=process, app=app, rect=rect, z=z,
             minimized=minimized, maximized=bool(win32.IsZoomed(h)), topmost=bool(ex & win32.WS_EX_TOPMOST),
             see_through=see_through, is_app=is_app, owner=own, monitor=mon,
+            alpha=alpha, rect_exact=exact, app_pid=app_pid, attributed=attributed,
         )
         layers.append(_with_host(w, host))
-    return Desktop(tuple(monitors), tuple(layers), cursor, fg, under, host, time.time())
+    return Desktop(tuple(monitors), tuple(layers), cursor, fg, under, host, time.time(), refresh=lambda: snapshot(host))
 
 
 def _monitor_for(monitors: list[Monitor], rect: Rect) -> int | None:

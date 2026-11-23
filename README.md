@@ -164,14 +164,41 @@ deliberate choice:
 
   [work]
   allow_apps = ["Code.exe", "WindowsTerminal.exe"]   # exe names
-  allow_browser_titles = ['\blocalhost\b']           # regexes on the active tab's title
   ```
 
+  **`allow_apps` is the boundary to rely on.** `allow_browser_titles` (and
+  `allow_titles`) match the window title, and a browser's title is the
+  active page's `<title>`, which the page itself controls: any website can
+  call itself "localhost" or "Jira" and be shown. Treat title rules as a
+  convenience for low-stakes cases, never as a security boundary. If you need
+  strict control over which web apps the AI can see, run your work tools in a
+  dedicated browser (or a separate browser exe/profile used only for them)
+  and allow that program by exe name instead, keeping your everyday browser
+  off the list.
+
   The block list below still applies on top of the allow list. In the work
-  profile `latest_snip` only reads the clipboard, not the Screenshots folder
-  (a snip can't be redacted), unless you set `allow_snip_folder = true`.
-  Captures, marks and baselines taken under the personal profile aren't
-  shown again after you switch to work.
+  profile `latest_snip` only reads a bitmap on the clipboard (not the
+  Screenshots folder, and not files copied in Explorer), because a snip can't
+  be redacted, unless you set `allow_snip_folder = true`. Captures, marks and
+  baselines are stamped with the profile and a hash of the allow/block lists
+  and sealed with a per-install key (`~/.argus/seal.key`), so the work profile
+  only shows again images it redacted under its *current* settings: nothing
+  from the personal profile, from before you changed the lists, or from a
+  file Argus didn't write.
+
+  The work profile fails closed. A `config.toml` that doesn't parse, an
+  unknown profile name, a setting of the wrong type or a broken regex in
+  `[profile]`, `[privacy]` or `[work]` switches to the work profile with
+  nothing allowed until you fix it (`argus status` and the tray tooltip say
+  what's wrong). Windows that might be drawing on top of an allowed one -
+  see-through or click-through overlays, popups that can't be tied to the
+  allowed window, UWP apps whose process can't be identified - are blacked
+  out, as are the rounded corners of allowed windows. If the windows on
+  screen change while a capture is being taken, Argus retries and then
+  refuses rather than risk a mask that doesn't match the pixels. It isn't
+  perfect: a window that appears and vanishes within one capture can still
+  slip through, so keep reviewing what you share.
+
 - **Approve sharing from the tray.** In the work profile, the Argus tray queues
   requests from all MCP clients and shows one always-on-top preview at a time.
   Review the image and text tabs, then choose **Send**, **Deny** (or Esc), or

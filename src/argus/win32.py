@@ -380,10 +380,25 @@ def window_rect(hwnd: int) -> Rect:
 
 def frame_rect(hwnd: int) -> Rect:
     """The visible frame, without the invisible resize borders Windows 10/11 add."""
+    return frame_rect_ex(hwnd)[0]
+
+
+def frame_rect_ex(hwnd: int) -> tuple[Rect, bool]:
+    """(frame rect, exact). Not exact when DWM couldn't say and the plain window
+    rect (which includes invisible borders) had to stand in."""
     r = RECT()
     if DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(r), ctypes.sizeof(r)) == 0:
-        return r.to_rect()
-    return window_rect(hwnd)
+        return r.to_rect(), True
+    return window_rect(hwnd), False
+
+
+PHYSICAL_DPI_MODES = ("per-monitor-v2", "per-monitor")
+
+
+def dpi_ok() -> bool:
+    """Are the coordinates Argus reads physical pixels (per-monitor DPI aware)?
+    If not, window rects are scaled by Windows and can't be trusted for redaction."""
+    return DPI_AWARENESS in PHYSICAL_DPI_MODES
 
 
 def layered_alpha(hwnd: int) -> int | None:

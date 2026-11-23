@@ -9,7 +9,7 @@ import pytest
 from mcp import Client
 from PIL import Image
 
-from argus import gate, server, service
+from argus import config, gate, server, service
 from argus.capture import Shot
 from argus.config import set_profile
 from argus.desktop import NO_HOST, ArgusError
@@ -36,6 +36,12 @@ class StubSession:
             raise ArgusError("There is no monitor 9.")
         if monitor == "boom":
             raise RuntimeError("kaboom")
+        if monitor == "phi":
+            raise KeyError("Doe, John (MRN 123456) - Epic")
+        if monitor == "path":
+            from argus.config import home
+
+            raise ArgusError(f"No such file: {home() / 'captures' / '2026-11-01' / '120000_c1_doe-john-chart.png'}")
         return Result().add(self._cap())
 
     def list_screens(self):
@@ -146,7 +152,8 @@ def capture_session(monkeypatch):
     set_profile("work")
     windows = frozenset({(10, "example.exe", 100)})
     shot = Shot(Image.new("RGB", (40, 32), "navy"), "region", "Private text", (0, 0),
-                {"region": [0, 0, 40, 32]}, profile="work", share_windows=windows)
+                {"region": [0, 0, 40, 32]}, profile="work", share_windows=windows,
+                policy=config.settings().policy)
     s = Session(host=NO_HOST, track=False)
     monkeypatch.setattr(server, "_session", s)
     monkeypatch.setattr(s, "desk", lambda: None)
@@ -284,3 +291,38 @@ def test_wait_prompts_again_on_window_change(capture_session, monkeypatch, secon
         assert [c.type for c in result.content] == ["text", "text", "image"]
         assert seen[1].text == tuple(c.text for c in result.content if c.type == "text")
         assert seen[1].images == (base64.b64decode(result.content[-1].data),)
+WORK = '[profile]\nactive = "work"\n[work]\nallow_apps = ["Code.exe"]\n'
+
+
+def _work_profile(argus_home):
+    from argus import config
+
+    argus_home.mkdir(parents=True, exist_ok=True)
+    config.config_path().write_text(WORK, encoding="utf-8")
+
+
+def test_work_profile_hides_unexpected_error_details(stub, argus_home, caplog):
+    _work_profile(argus_home)
+    r = call("screenshot", {"monitor": "phi"})
+    text = r.content[0].text
+    assert r.is_error and "error id" in text and "MRN" not in text and "Doe" not in text
+    assert "KeyError" in caplog.text and "MRN" not in caplog.text and "Doe" not in caplog.text
+
+
+def test_work_profile_scrubs_data_paths_from_errors(stub, argus_home, monkeypatch):
+    _work_profile(argus_home)
+    seen = []
+
+    def approve(preview):
+        seen.append(preview)
+        return "user"
+
+    monkeypatch.setattr(gate, "_transport", approve)
+    r = call("screenshot", {"monitor": "path"})
+    assert r.is_error and "doe-john" not in r.content[0].text and "<Argus data folder>" in r.content[0].text
+    assert seen and "doe-john" not in seen[0].text[0]  # the preview gets the scrubbed text too
+
+
+def test_personal_profile_errors_are_unchanged(stub, argus_home):
+    r = call("screenshot", {"monitor": "path"})
+    assert r.is_error and "doe-john" in r.content[0].text
