@@ -139,9 +139,12 @@ def _emit(result, args, out: Path | None = None) -> None:
     from .service import caption
 
     caps = result.captures
+    parts = result.parts
+    if result.query:
+        parts = [f"Requested text: {result.query}", *parts]
     if getattr(args, "json", False):
         payload = {
-            "text": [p for p in result.parts if isinstance(p, str)],
+            "text": [p for p in parts if isinstance(p, str)],
             "captures": [
                 {"id": c.id, "label": c.shot.label, "path": str(c.path) if c.path else None,
                  "width": c.image.width, "height": c.image.height, "notes": c.shot.notes, "hidden": c.shot.hidden}
@@ -150,7 +153,7 @@ def _emit(result, args, out: Path | None = None) -> None:
         }
         print(json.dumps(payload, indent=2))
     else:
-        for part in result.parts:
+        for part in parts:
             print(part if isinstance(part, str) else caption(part))
             print()
     if out is not None and caps:

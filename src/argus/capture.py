@@ -15,7 +15,7 @@ from . import win32
 from .config import Settings
 from .desktop import ArgusError, Desktop, Monitor, Window, find_monitors, find_windows
 from .geometry import Rect
-from .privacy import WindowSet, check_window, display_name, redact, sensitive_reason, share_scope, shown
+from .privacy import WindowSet, check_window, display_name, named_windows, redact, sensitive_reason, share_scope, shown
 
 
 @dataclass
@@ -36,6 +36,7 @@ class Shot:
     profile: str = ""  # privacy profile it was taken under ("" = unknown, e.g. any image file)
     share_windows: WindowSet | None = None  # live provenance, never loaded from a PNG
     policy: str = ""  # Settings.policy it was redacted under ("" = unknown or not authenticated)
+    allow_trust: bool = True  # captions can name windows outside the pixel scope
 
     @property
     def cursor_in_image(self) -> tuple[int, int] | None:
@@ -140,7 +141,7 @@ def capture_monitor(desk: Desktop, mon: Monitor, s: Settings) -> Shot:
         cursor=desk.cursor,
         monitor=mon,
         profile=s.profile,
-        share_windows=share_scope(desk, s) if s.requires_approval else None,
+        share_windows=share_scope(desk, s, mon.rect) if s.requires_approval else None,
         policy=s.policy,
     )
 
@@ -165,7 +166,7 @@ def capture_region(desk: Desktop, rect: Rect, s: Settings, label: str | None = N
         cursor=desk.cursor,
         monitor=mon,
         profile=s.profile,
-        share_windows=share_scope(desk, s) if s.requires_approval else None,
+        share_windows=share_scope(desk, s, clipped) if s.requires_approval else None,
         policy=s.policy,
     )
 
@@ -219,7 +220,6 @@ def capture_window(desk: Desktop, win: Window, s: Settings) -> Shot:
         monitor=mon,
         window=win,
         profile=s.profile,
-        share_windows=share_scope(desk, s, [win]) if s.requires_approval else None,
         policy=s.policy,
     )
     visible = desk.visible_fraction(win)
@@ -247,7 +247,7 @@ def capture_window(desk: Desktop, win: Window, s: Settings) -> Shot:
         base.image, area, base.hidden, final = _grab_redacted(desk, s, area_of)
         base.origin = (area.x, area.y)
         if s.requires_approval:  # trust what the pixels came from, not the first snapshot
-            base.share_windows = share_scope(final, s, [final.window(win.hwnd) or win])
+            base.share_windows = share_scope(final, s, area, target=final.window(win.hwnd) or win)
         if visible < 0.995:
             covered = round((1 - visible) * 100)
             base.notes.append(
@@ -260,6 +260,9 @@ def capture_window(desk: Desktop, win: Window, s: Settings) -> Shot:
     if rendered is not None:
         base.image, base.method = rendered, "printwindow"
         base.origin = (win.rect.x, win.rect.y)
+        if s.requires_approval:
+            area = Rect(*base.origin, rendered.width, rendered.height)
+            base.share_windows = share_scope(desk, s, area, target=win)
         covered = round((1 - visible) * 100)
         base.notes.append(
             f"About {covered}% of this window is covered or off-screen, so Argus had it render itself "
@@ -273,6 +276,8 @@ def capture_window(desk: Desktop, win: Window, s: Settings) -> Shot:
     base.image = grab(area)
     base.origin = (area.x, area.y)
     base.hidden = redact(base.image, base.origin, desk, s)
+    if s.requires_approval:
+        base.share_windows = share_scope(desk, s, area, target=win)
     base.notes.append(
         "The window is partly covered and can't render itself offscreen, so this shows what's actually on "
         "screen there, including whatever is on top of it."
@@ -315,7 +320,7 @@ def capture(desk: Desktop, s: Settings, monitor=None, window=None, region=None) 
         if others:
             shot.notes.append("Also matched: " + "; ".join(f"{name(w)} [{w.handle}]" for w in others) + ".")
         if shot.share_windows is not None:
-            shot.share_windows |= share_scope(desk, s, [win, *others])
+            shot.allow_trust = named_windows([win, *others], s) <= shot.share_windows
         return [shot]
 
     if monitor is not None:

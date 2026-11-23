@@ -19,6 +19,7 @@ from .config import Settings
 from .desktop import ArgusError, Paused, PolicyChanged
 from .geometry import Rect
 from .store import meta, open_file, png_info, replayable
+from .text import display_arg
 
 # ---------------------------------------------------------------------- diff
 
@@ -152,7 +153,7 @@ def load_baseline(name: str, s: Settings | None = None) -> Shot:
         rows, hidden = baselines(s)
         names = ", ".join(n for n, *_ in rows) or "none yet"
         more = f" ({hidden} more hidden: not saved under the current work profile)" if hidden else ""
-        raise ArgusError(f"No baseline named {name!r}. Saved baselines: {names}{more}.")
+        raise ArgusError(f"No baseline named {display_arg(name)!r}. Saved baselines: {names}{more}.")
     shot = open_file(path)
     shot.kind = "baseline"
     return shot
@@ -248,9 +249,9 @@ async def wait_for(
             lines = await read(last.image)  # type: ignore[misc]
             hits = find(lines, text)  # type: ignore[misc]
             if until == "text" and hits:
-                return WaitResult(True, last, elapsed(), f'"{text}" appeared', matches=hits)
+                return WaitResult(True, last, elapsed(), "the requested text appeared", matches=hits)
             if until == "text_gone" and not hits:
-                return WaitResult(True, last, elapsed(), f'"{text}" is no longer on screen')
+                return WaitResult(True, last, elapsed(), "the requested text is no longer on screen")
         elif until == "change" and polls:
             d = diff(first.image, last.image)
             if d.changed >= min_change:
@@ -270,8 +271,8 @@ async def wait_for(
             what = {
                 "change": "the screen didn't change",
                 "stable": "the screen kept changing",
-                "text": f'"{text}" never appeared',
-                "text_gone": f'"{text}" was still on screen',
+                "text": "the requested text never appeared",
+                "text_gone": "the requested text was still on screen",
             }[until]
             return WaitResult(False, last, elapsed(), f"{what} within {timeout:g}s")
         if progress:

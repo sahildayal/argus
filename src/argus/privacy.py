@@ -7,7 +7,7 @@ import json
 import shutil
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
 from PIL import Image, ImageChops, ImageDraw
@@ -156,17 +156,46 @@ WORK_LABEL = "Hidden by Argus: work profile"
 WindowSet = frozenset[tuple[int, str, int]]  # HWND, executable name, PID
 
 
-def share_scope(desk: Desktop, s: Settings, extra: Sequence[Window] = ()) -> WindowSet:
-    """The live window identities behind pixels, plus any named separately."""
-    if s.work:
-        handles = shown_windows(desk, s)
-        windows = [w for w in desk.layers if w.hwnd in handles]
-    else:
-        windows = [w for w in desk.layers if w.is_app and not w.minimized and shown(w, s)]
-    return frozenset(
-        (w.hwnd, w.process.lower(), w.pid)
-        for w in [*windows, *(w for w in extra if shown(w, s))]
-    )
+def named_windows(windows: Iterable[Window], s: Settings) -> WindowSet:
+    """Window identities whose titles can appear in a result."""
+    return frozenset(window_identity(w) for w in windows if shown(w, s))
+
+
+def window_identity(w: Window) -> tuple[int, str, int]:
+    return w.hwnd, w.process.lower(), w.pid
+
+
+def _uncovered(area: Rect, covered: Rect) -> Iterator[Rect]:
+    overlap = area.intersect(covered)
+    if overlap is None:
+        yield area
+        return
+    for remainder in (
+        Rect.ltrb(area.x, area.y, area.right, overlap.y),
+        Rect.ltrb(area.x, overlap.bottom, area.right, area.bottom),
+        Rect.ltrb(area.x, overlap.y, overlap.x, overlap.bottom),
+        Rect.ltrb(overlap.right, overlap.y, area.right, overlap.bottom),
+    ):
+        if not remainder.empty:
+            yield remainder
+
+
+def share_scope(desk: Desktop, s: Settings, region: Rect, *, target: Window | None = None) -> WindowSet:
+    """Allowed windows visible in the capture area, including its explicit target."""
+    handles = shown_windows(desk, s) if s.work else {w.hwnd for w in desk.windows if shown(w, s)}
+    scope = set() if target is None else set(named_windows([target], s))
+    remaining = [area for m in desk.monitors if (area := region.intersect(m.rect))]
+    # Match desktop redaction's layer order. A hidden window can still cover
+    # an allowed one, and windows can be covered by more than one layer.
+    for w in desk.layers:
+        if not remaining:
+            break
+        if w.minimized or w.see_through or not any(area.intersect(w.rect) for area in remaining):
+            continue
+        if w.hwnd in handles:
+            scope.add(window_identity(w))
+        remaining = [part for area in remaining for part in _uncovered(area, w.rect)]
+    return frozenset(scope)
 
 
 def _live(desk: Desktop) -> list[Window]:

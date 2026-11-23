@@ -16,6 +16,7 @@ Stamp = tuple[tuple[int, int, int], tuple[int, int, int]]
 Reason = Literal["user", "trusted", "timeout", "tray_unavailable", "denied", "not_required"]
 DECLINED = "The user declined to share this capture."
 UNAVAILABLE = "Approval is unavailable. Ask the user to start or check the Argus tray (argus-tray), then try again."
+QUERY_LABEL = "Requested by the AI"
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class Preview:
     deadline: float
     allow_trust: bool
     watching: bool
+    query: str = ""
 
 
 class GateStopped(Exception):
@@ -89,6 +91,7 @@ def request(
     previously_approved: bool = False,
     allow_trust: bool = True,
     watching: bool = False,
+    query: str = "",
     transport: Callable[[Preview], str] | None = None,
 ) -> Decision:
     """Decide whether MCP can disclose an output or use an earlier watch segment."""
@@ -103,7 +106,7 @@ def request(
             reason = "not_required"
         else:
             deadline = time.monotonic() + current.timeout
-            preview = Preview(rid, tool, shots, text, windows, current.stamp, deadline, allow_trust, watching)
+            preview = Preview(rid, tool, shots, text, windows, current.stamp, deadline, allow_trust, watching, query)
             reply = (transport or _transport)(preview)
             if time.monotonic() >= deadline:
                 reason = "timeout"
@@ -111,8 +114,8 @@ def request(
                 reason = "denied"
             elif reply in ("user", "denied", "timeout", "tray_unavailable"):
                 reason = reply
-            elif reply == "trusted" and allow_trust and windows is not None:
-                reason = "trusted"
+            elif reply == "trusted":
+                reason = "trusted" if allow_trust and windows else "denied"
     except TimeoutError:
         reason = "timeout"
     except (OSError, ValueError, GateStopped):
@@ -147,12 +150,14 @@ class Trust:
             and current.stamp == self.stamp
             and time.monotonic() < self.expires
             and self.windows is not None
-            and preview.windows is not None
+            and bool(preview.windows)
             and preview.windows <= self.windows
         )
 
-    def grant(self, preview: Preview, current: Policy) -> None:
-        if self.valid(preview, current) and preview.windows:
-            self.stamp = current.stamp
-            self.windows = preview.windows
-            self.expires = time.monotonic() + current.trust_minutes * 60
+    def grant(self, preview: Preview, current: Policy) -> bool:
+        if not (preview.allow_trust and preview.windows and self.valid(preview, current)):
+            return False
+        self.stamp = current.stamp
+        self.windows = preview.windows
+        self.expires = time.monotonic() + current.trust_minutes * 60
+        return True

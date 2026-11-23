@@ -67,18 +67,33 @@ def test_trust_scope_and_expiration():
     current = gate.policy()
     trust = gate.Trust()
     preview = gate.Preview("request", "look", (), (), WINDOWS, current.stamp, time.monotonic() + 30, True, False)
-    trust.grant(preview, current)
+    assert trust.grant(preview, current)
     assert trust.covers(preview, current)
     assert trust.covers(replace(preview, windows=frozenset({(1, "code.exe", 101)})), current)
     assert not trust.covers(replace(preview, windows=WINDOWS | {(3, "code.exe", 101)}), current)
     assert not trust.covers(replace(preview, windows=frozenset({(1, "code.exe", 303)})), current)
     assert not trust.covers(replace(preview, windows=None), current)
+    assert not trust.covers(replace(preview, windows=frozenset()), current)
     assert not trust.covers(replace(preview, allow_trust=False), current)
     trust.expires = time.monotonic() - 1
     assert not trust.covers(preview, current)
     trust.grant(preview, current)
     trust.revoke()
     assert not trust.covers(preview, current)
+
+
+@pytest.mark.parametrize(("allow_trust", "windows"), [(False, WINDOWS), (True, frozenset())])
+def test_trust_refuses_ineligible_requests(allow_trust, windows):
+    set_profile("work")
+    current = gate.policy()
+    trust = gate.Trust()
+
+    def transport(preview):
+        assert not trust.grant(preview, current)
+        assert trust.windows is None
+        return "trusted"
+
+    assert gate.request("look", windows=windows, allow_trust=allow_trust, transport=transport).reason == "denied"
 
 
 @pytest.mark.parametrize("change", ["profile", "pause"])

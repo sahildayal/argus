@@ -237,6 +237,8 @@ GetAncestor = _fn(user32, "GetAncestor", HWND, HWND, wintypes.UINT)
 GetPropW = _fn(user32, "GetPropW", wintypes.HANDLE, HWND, wintypes.LPCWSTR)
 SetPropW = _fn(user32, "SetPropW", wintypes.BOOL, HWND, wintypes.LPCWSTR, wintypes.HANDLE)
 SetWindowDisplayAffinity = _fn(user32, "SetWindowDisplayAffinity", wintypes.BOOL, HWND, wintypes.DWORD)
+SetWindowPos = _fn(user32, "SetWindowPos", wintypes.BOOL, HWND, HWND, ctypes.c_int, ctypes.c_int,
+                   ctypes.c_int, ctypes.c_int, wintypes.UINT)
 APPROVAL_PREVIEW = "Argus.ApprovalPreview"
 GetForegroundWindow = _fn(user32, "GetForegroundWindow", HWND)
 WindowFromPoint = _fn(user32, "WindowFromPoint", HWND, POINT)
