@@ -18,6 +18,7 @@ from PIL import Image, PngImagePlugin
 from .capture import Shot
 from .config import home
 from .desktop import ArgusError
+from .gate import Stamp
 from .imaging import View
 
 
@@ -27,6 +28,7 @@ class Capture:
     shot: Shot
     view: View
     path: Path | None
+    shared_at: Stamp | None = None  # approval is bound to this in-memory capture and policy
 
     @property
     def image(self) -> Image.Image:

@@ -26,6 +26,11 @@ from .store import Capture, Store, open_file
 @dataclass
 class Result:
     parts: list[str | Capture] = field(default_factory=list)
+    sources: list[Capture] = field(default_factory=list)
+    evidence: list[Shot] = field(default_factory=list)
+    mark_id: str | None = None
+    screen_derived: bool = True
+    window_scope: privacy.WindowSet | None = None
 
     def text(self, *lines: str) -> Result:
         self.parts.append("\n".join(line for line in lines if line))
@@ -88,11 +93,12 @@ def _require_profile(shot: Shot, s: Settings) -> None:
 
 
 class Session:
-    def __init__(self, host: Host | None = None, track: bool = True):
+    def __init__(self, host: Host | None = None, track: bool = True, *, defer_marks: bool = False):
         self.host = host or detect_host()
         self.tracker = Tracker().start() if track else None
         self.store = Store()
         self.used_marks: set[str] = set()
+        self.defer_marks = defer_marks
 
     # -- plumbing ----------------------------------------------------------------
 
@@ -158,9 +164,10 @@ class Session:
             if mark and mark.id not in self.used_marks and time.time() - mark.when <= s.mark_freshness:
                 shot = mark.shot(scope)
                 if shot is not None and _profile_ok(shot, s):
-                    self.used_marks.add(mark.id)
+                    if not self.defer_marks:
+                        self.used_marks.add(mark.id)
                     what = mark.info.get("monitor" if scope == "monitor" else "window") or mark.info.get("monitor")
-                    result = Result().text(
+                    result = Result(mark_id=mark.id).text(
                         f"Using the hotkey mark you made {ago(time.time() - mark.when)} ago: {what}. "
                         "(look(fresh=true) captures live instead.)"
                     )
@@ -216,6 +223,11 @@ class Session:
                 raise ArgusError(f"{exc} {' '.join(footer)}") from None
             header = f"Picked {name(win)} because {choice.reason}."
         result = Result().text(notice, header)
+        extra = [w for _, w in choice.alternatives]
+        if choice.host is not None:
+            extra.append(choice.host)
+        if shot.share_windows is not None:
+            shot.share_windows |= privacy.share_scope(desk, s, extra)
         self._show(result, [shot], grid)
         return result.text(*footer)
 
@@ -270,8 +282,9 @@ class Session:
             window=cap.shot.window,
             taken=cap.shot.taken,
             profile=cap.shot.profile,
+            share_windows=cap.shot.share_windows,
         )
-        return Result().add(self.register(shot, grid=grid, upscale_to=1200))
+        return Result(sources=[cap]).add(self.register(shot, grid=grid, upscale_to=1200))
 
     # -- list --------------------------------------------------------------------------
 
@@ -280,7 +293,7 @@ class Session:
         from . import __version__
 
         if state.paused:
-            return Result().text(f"Argus {__version__}: {state.describe()} by the user. Nothing can be listed or captured until they resume it.")
+            return Result(screen_derived=False).text(f"Argus {__version__}: {state.describe()} by the user. Nothing can be listed or captured until they resume it.")
         s = settings()
         desk = self.desk()
         lines = [f"Argus {__version__}: captures {state.describe()}, {s.profile} profile. You're chatting from: {host_label(desk)}."]
@@ -318,7 +331,8 @@ class Session:
             lines.append(f"On the privacy list (blacked out in captures): {', '.join(hidden)}.")
         for problem in s.problems:
             lines.append(f"Config problem: {problem}")
-        return Result().text(*lines)
+        scope = privacy.share_scope(desk, s, desk.windows) if s.requires_approval else None
+        return Result(window_scope=scope).text(*lines)
 
     @staticmethod
     def _safe_label(w: Window, s: Settings) -> str:
@@ -346,7 +360,6 @@ class Session:
         tr = self.tracker
         # Snips can't be redacted (Argus doesn't know what windows they show), so
         # the work profile skips the Screenshots folder unless the user opted in.
-        # TODO(work-profile step 3): gate snips behind the user confirmation prompt.
         files = not s.work or s.allow_snip_folder
         snips = latest_snips(count, tr.clip_time if tr else None, tr.clip_seq if tr else None, include_files=files)
         if not snips:
@@ -389,9 +402,10 @@ class Session:
                 "The latest mark was made before the user's work profile was turned on, so Argus won't share it. "
                 f"They can mark again with {pretty_hotkey(s.hotkey_mark)}."
             )
-        self.used_marks.add(mark.id)
+        if not self.defer_marks:
+            self.used_marks.add(mark.id)
         what = mark.info.get("monitor" if scope == "monitor" else "window") or mark.info.get("monitor")
-        result = Result().text(f"Hotkey mark from {ago(time.time() - mark.when)} ago: {what}.")
+        result = Result(mark_id=mark.id).text(f"Hotkey mark from {ago(time.time() - mark.when)} ago: {what}.")
         return self._show(result, [shot], grid)
 
     # -- OCR ---------------------------------------------------------------------------
@@ -405,8 +419,9 @@ class Session:
 
     async def read_text(self, monitor=None, window=None, region=None, capture_id=None, positions: bool = True) -> Result:
         self.guard()
-        result = Result()
-        for cap in await self._ocr_targets(monitor, window, region, capture_id):
+        caps = await self._ocr_targets(monitor, window, region, capture_id)
+        result = Result(sources=caps)
+        for cap in caps:
             lines = await ocr.read(cap.image)
             head = f"[{cap.id}] Text in {cap.shot.label}"
             if positions:
@@ -420,13 +435,15 @@ class Session:
         self.guard()
         found: list[tuple[Capture, ocr.Match]] = []
         first_lines: list[ocr.Line] = []
-        for cap in await self._ocr_targets(monitor, window, region, capture_id):
+        caps = await self._ocr_targets(monitor, window, region, capture_id)
+        result = Result(sources=caps)
+        for cap in caps:
             lines = await ocr.read(cap.image)
             first_lines = first_lines or lines
             found.extend((cap, m) for m in ocr.find(lines, text))
         if not found:
             sample = "; ".join(ln.text for ln in first_lines[:12]) or "nothing legible"
-            return Result().text(f'"{text}" is not on screen (OCR). Text it did read includes: {sample}.')
+            return result.text(f'"{text}" is not on screen (OCR). Text it did read includes: {sample}.')
         found.sort(key=lambda cm: -cm[1].score)
         lines = [f'Found "{text}" {len(found)} time(s):']
         for i, (cap, m) in enumerate(found[:10], 1):
@@ -452,20 +469,22 @@ class Session:
             image=img.crop((bx0, by0, bx1, by1)), kind="zoom", label=f'best match for "{text}" (from {cap.id})',
             origin=origin, target={}, method="crop", cursor=cap.shot.cursor, taken=cap.shot.taken,
             profile=cap.shot.profile,
+            share_windows=cap.shot.share_windows,
         )
         box = (best.box[0] - bx0, best.box[1] - by0, best.box[2] - bx0, best.box[3] - by0)
-        result = Result().text(*lines)
-        return result.add(self.register(crop, grid=False, boxes=[box], upscale_to=900))
+        return result.text(*lines).add(self.register(crop, grid=False, boxes=[box], upscale_to=900))
 
     # -- testing -------------------------------------------------------------------------
 
-    def save_baseline(self, name: str, monitor=None, window=None, region=None) -> Result:
+    def save_baseline(self, name: str, monitor=None, window=None, region=None, *, local_receipt: bool = False) -> Result:
         s = self.guard()
         shots = capture(self.desk(), s, monitor, window, region)
         if len(shots) != 1:
             raise ArgusError("A baseline is one monitor, window or region, not 'all'.")
         shot = shots[0]
         path = testing.save_baseline(name, shot)
+        if local_receipt:
+            return Result(screen_derived=False).text(f"Saved baseline {path.stem!r}.")
         cap = self.register(shot, grid=False, save=False)
         w, h = shot.image.size
         return Result().text(
@@ -501,21 +520,24 @@ class Session:
             except (TypeError, ValueError):
                 raise ArgusError("ignore takes a list of [x, y, width, height] boxes") from None
         d = testing.diff(before.image, after.image, threshold=max(0, min(int(threshold), 255)), ignore=rects)
+        result = Result(evidence=[before, after])
         if d.changed == 0:
             cap = self.register(after, grid=False)
-            return Result().text(f"No visible change between {name_before} and now [{cap.id}]." + (f" {d.note}" if d.note else ""))
+            return result.text(f"No visible change between {name_before} and now [{cap.id}]." + (f" {d.note}" if d.note else ""))
 
         # Regions are in `before` pixels; map them onto `after` if its size differs.
         sx, sy = after.image.width / before.image.width, after.image.height / before.image.height
         boxes = [(r.x * sx, r.y * sy, r.right * sx, r.bottom * sy) for r in d.regions]
-        result = Result()
         if show == "both":
             half = (s.max_side - 12) // 2  # the pair fits in one max_side-wide image
             _lv, left = render(before.image, max_side=half)
             right_view, right = render(after.image, max_side=half, boxes=boxes)
             combo = side_by_side(left, right, labels=(name_before, "now (changes boxed)"))
+            scope = None
+            if before.share_windows is not None and after.share_windows is not None:
+                scope = before.share_windows | after.share_windows
             shot = Shot(image=combo, kind="compare", label=f"{name_before} vs now", origin=None, target={}, method="composite",
-                        profile=after.profile)
+                        profile=after.profile, share_windows=scope)
             cap = self.register(shot, grid=False)
             sc, cs = right_view.scale, cap.view.scale
             ox, oy = left.width + 12, 26
@@ -533,7 +555,8 @@ class Session:
         return result.add(cap)
 
     async def wait_for(self, until: str, text: str | None = None, monitor=None, window=None, region=None,
-                       timeout: float = 30.0, progress: Callable[[float, float, str], Awaitable[None]] | None = None) -> Result:
+                       timeout: float = 30.0, progress: Callable[[float, float, str], Awaitable[None]] | None = None,
+                       *, approve_frame: Callable[[Shot], Awaitable[None]] | None = None) -> Result:
         s = self.guard()
         timeout = max(1.0, min(float(timeout), 600.0))
         shots = await anyio.to_thread.run_sync(lambda: capture(self.desk(), s, monitor, window, region))
@@ -541,19 +564,33 @@ class Session:
             raise ArgusError("wait_for watches one monitor, window or region, not 'all'.")
         pending = [shots[0]]
         target = shots[0].target
+        approval_time = 0.0
 
         async def grab() -> Shot:
+            nonlocal approval_time
             privacy.ensure_not_paused()
             if pending:
-                return pending.pop()
-            return await anyio.to_thread.run_sync(lambda: recapture(self.desk(), settings(), target))
+                shot = pending.pop()
+            else:
+                try:
+                    shot = await anyio.to_thread.run_sync(lambda: recapture(self.desk(), settings(), target))
+                except ArgusError:
+                    if approve_frame is not None:
+                        raise ArgusError("The target can no longer be captured.") from None
+                    raise
+            if approve_frame is not None:
+                requested_at = time.monotonic()
+                await approve_frame(shot)
+                approval_time += time.monotonic() - requested_at
+            return shot
 
         async def report(elapsed: float, message: str) -> None:
             if progress is not None:
                 await progress(elapsed, timeout, message)
 
         outcome = await testing.wait_for(
-            grab, until, text=text, read=ocr.read, find=ocr.find, timeout=timeout, progress=report
+            grab, until, text=text, read=ocr.read, find=ocr.find, timeout=timeout, progress=report,
+            clock=lambda: time.monotonic() - approval_time,
         )
         boxes = None
         if outcome.matches:

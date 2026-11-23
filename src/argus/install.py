@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import home
+from .config import home, tray_mutex_name
 from .desktop import ArgusError
 
 NAME = "argus"
@@ -293,7 +293,7 @@ def start_tray(tray: str) -> None:
 def tray_running() -> bool:
     from . import win32
 
-    handle = win32.CreateMutexW(None, False, "Local\\ArgusTray")
+    handle = win32.CreateMutexW(None, False, tray_mutex_name())
     import ctypes
 
     exists = ctypes.get_last_error() == win32.ERROR_ALREADY_EXISTS

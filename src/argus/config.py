@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import math
 import os
 import re
 import threading
@@ -22,6 +24,12 @@ DEFAULT_CONFIG = """\
 #   screens can show confidential data (patient records, customer data, ...).
 # Switch with the tray menu or `argus profile work` / `argus profile personal`.
 active = "personal"
+
+[gate]
+# Approval is on in work, off in personal. Uncomment to opt in for personal too.
+# enabled = true
+timeout_seconds = 30
+trust_minutes = 10
 
 [capture]
 # Longest side (px) of images sent to the AI. 2000 keeps long sessions with
@@ -111,6 +119,14 @@ def config_path() -> Path:
     return home() / "config.toml"
 
 
+def tray_mutex_name() -> str:
+    path = os.path.normcase(str(home().resolve()))
+    default = os.path.normcase(str((Path.home() / ".argus").resolve()))
+    if path == default:
+        return "Local\\ArgusTray"
+    return "Local\\ArgusTray-" + hashlib.sha256(path.encode()).hexdigest()
+
+
 @dataclass(frozen=True)
 class Settings:
     max_side: int = 2000
@@ -131,11 +147,18 @@ class Settings:
     allow_browser_titles: tuple[re.Pattern, ...] = ()
     allow_titles: tuple[re.Pattern, ...] = ()
     allow_snip_folder: bool = False
+    gate_enabled: bool = False  # personal opt-in; work always requires approval
+    gate_timeout_seconds: float = 30.0
+    gate_trust_minutes: float = 10.0
     problems: tuple[str, ...] = field(default=())
 
     @property
     def work(self) -> bool:
         return self.profile == "work"
+
+    @property
+    def requires_approval(self) -> bool:
+        return self.work or self.gate_enabled
 
     @classmethod
     def from_toml(cls, text: str) -> Settings:
@@ -154,6 +177,10 @@ class Settings:
             else:
                 problems.append(f"config.toml is not valid TOML ({exc}); using defaults")
         defaults = tomllib.loads(DEFAULT_CONFIG)
+        gate = data.get("gate", {})
+        if not isinstance(gate, dict):
+            problems.append("gate: expected a table; using the defaults")
+            gate = {}
 
         def get(section: str, key: str):
             return data.get(section, {}).get(key, defaults[section][key])
@@ -166,6 +193,13 @@ class Settings:
                 except re.error as exc:
                     problems.append(f"{section}.{key}: bad regex {raw!r} ({exc})")
             return tuple(out)
+
+        def gate_duration(key: str) -> float:
+            value = gate.get(key, defaults["gate"][key])
+            if type(value) in (int, float) and 0 < value <= 86400 and math.isfinite(value):
+                return float(value)
+            problems.append(f"gate.{key}: expected a positive number up to 86400; using the default")
+            return float(defaults["gate"][key])
 
         profile = str(get("profile", "active")).strip().lower()
         if profile not in PROFILES:
@@ -191,6 +225,9 @@ class Settings:
             allow_browser_titles=patterns("work", "allow_browser_titles"),
             allow_titles=patterns("work", "allow_titles"),
             allow_snip_folder=bool(get("work", "allow_snip_folder")),
+            gate_enabled=gate.get("enabled") is True,
+            gate_timeout_seconds=gate_duration("timeout_seconds"),
+            gate_trust_minutes=gate_duration("trust_minutes"),
             problems=tuple(problems),
         )
 
@@ -200,7 +237,15 @@ _WORK_LINE = re.compile(r"""^\s*active\s*=\s*["']work["']""", re.IGNORECASE | re
 
 
 _lock = threading.Lock()
-_cache: tuple[float, Settings] | None = None
+_cache: tuple[tuple[Path, int, int, int], Settings] | None = None
+
+
+def file_revision(path: Path) -> tuple[int, int, int]:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return (0, 0, 0)
+    return stat.st_ino, stat.st_mtime_ns, stat.st_size
 
 
 def settings() -> Settings:
@@ -210,9 +255,9 @@ def settings() -> Settings:
     with _lock:
         if not path.exists():
             path.write_text(DEFAULT_CONFIG, encoding="utf-8")
-        mtime = path.stat().st_mtime
-        if _cache is None or _cache[0] != mtime:
-            _cache = (mtime, Settings.from_toml(path.read_text(encoding="utf-8")))
+        revision = (path, *file_revision(path))
+        if _cache is None or _cache[0] != revision:
+            _cache = (revision, Settings.from_toml(path.read_text(encoding="utf-8")))
         return _cache[1]
 
 
