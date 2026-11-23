@@ -359,3 +359,34 @@ class PipeServer:
         finally:
             win.CloseHandle(handle)
             self._slots.release()
+
+
+def probe(timeout: float = 1.0) -> str:
+    """Read-only check for `argus status` / `argus doctor`: is a verified Argus
+    tray listening on this user's approval pipe? Connects, runs the same server
+    check as exchange(), and disconnects without sending anything.
+
+    Returns "verified", "unverified" (something else owns the pipe name),
+    "missing" (no tray on this pipe, e.g. none running or an older version's
+    tray listening on its own name), "busy" or "error"."""
+    address, sid = _address()
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            handle = win.CreateFile(address, 0x100003, 0, win.NULL, win.OPEN_EXISTING,
+                                    win.FILE_FLAG_OVERLAPPED | 0x110000, win.NULL)
+            break
+        except OSError as exc:
+            if exc.winerror == win.ERROR_PIPE_BUSY:
+                if time.monotonic() >= deadline:
+                    return "busy"
+                time.sleep(0.025)
+                continue
+            return "missing" if exc.winerror in (2, 3) else "error"  # FILE/PATH_NOT_FOUND
+    try:
+        _verify_tray(handle, sid)
+        return "verified"
+    except OSError:
+        return "unverified"
+    finally:
+        win.CloseHandle(handle)

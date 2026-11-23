@@ -85,6 +85,55 @@ def _open(ui, gate_ui, *, seconds=5, allow_trust=True, images=(), query=""):
     return pending
 
 
+def test_send_and_trust_arm_only_after_focus_settles(approval_ui, monkeypatch):
+    """The arming logic, driven by synthetic focus events, so it doesn't depend
+    on Windows letting this process take the foreground."""
+    ui, gate_ui = approval_ui
+    pending = _open(ui, gate_ui)
+    window, root = ui.window, ui.root
+    deny, send, trust = (_button(window, label) for label in ("Deny", "Send", "Send & trust"))
+    focus = {"widget": deny}
+    monkeypatch.setattr(window, "focus_displayof", lambda: focus["widget"])
+
+    def focus_event(kind):
+        window.event_generate(kind, detail="NotifyNonlinear")
+        root.update()
+
+    focus_event("<FocusOut>")
+    assert send.instate(["disabled"]) and trust.instate(["disabled"])
+    gained = time.monotonic()
+    focus_event("<FocusIn>")
+    assert send.instate(["disabled"]) and trust.instate(["disabled"])
+    _wait(root, lambda: send.instate(["!disabled"]))
+    assert time.monotonic() - gained >= gate_ui._ARM_MS / 1000 - 0.05
+    assert trust.instate(["!disabled"])
+
+    # Losing focus disarms at once; regaining it starts the delay again.
+    focus_event("<FocusOut>")
+    assert send.instate(["disabled"]) and trust.instate(["disabled"])
+    send.invoke()
+    assert not pending.done.is_set()
+
+    # Focus that moved elsewhere by the time the delay ends doesn't arm.
+    focus_event("<FocusIn>")
+    focus["widget"] = None
+    deadline = time.monotonic() + gate_ui._ARM_MS / 1000 + 0.3
+    while time.monotonic() < deadline:
+        root.update()
+        time.sleep(0.01)
+    assert send.instate(["disabled"]) and trust.instate(["disabled"])
+
+    focus["widget"] = deny
+    focus_event("<FocusIn>")
+    _wait(root, lambda: trust.instate(["!disabled"]))
+    trust.invoke()
+    assert pending.done.is_set() and pending.reason == "user"
+    assert ui.trust.covers(pending.preview, gate.policy())
+
+
+# Needs the OS to give this process real keyboard focus (focus_force), which
+# Windows refuses to background processes, so it only runs with -m live.
+@pytest.mark.live
 def test_send_and_trust_rearm_after_each_focus_gain(approval_ui):
     ui, gate_ui = approval_ui
     pending = _open(ui, gate_ui)

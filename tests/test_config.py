@@ -232,7 +232,6 @@ def test_set_work_list_rejects_invalid_values(argus_home):
 
 
 def test_allow_learn_never_prints_window_titles(argus_home, monkeypatch, capsys):
-    from types import SimpleNamespace
     from argus import cli
     from conftest import desk, mon, win
 
@@ -240,14 +239,14 @@ def test_allow_learn_never_prints_window_titles(argus_home, monkeypatch, capsys)
                win(2, "SECRET TAB", app="Browser", process="browser.exe")]
     fake_desk = desk([mon(1, 0, 0, 800, 600)], windows)
     monkeypatch.setattr("argus.desktop.snapshot", lambda *_: fake_desk)
-    tracker = SimpleNamespace(recent=lambda: [], stop=lambda: None)
-    monkeypatch.setattr("argus.service.Tracker", lambda: SimpleNamespace(start=lambda: tracker))
     answers = iter(["2", "y"])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
     assert cli.main(["allow", "--learn"]) == 0
     output = capsys.readouterr().out
     assert "Doe" not in output and "MRN" not in output and "SECRET TAB" not in output
     assert "Editor.exe" in output and config.settings().allow_apps == {"editor.exe"}
+    assert config.raw_work_lists()["allow_apps"] == ["Editor.exe"]  # spelled as the process reports it
+    assert "windows open now" in output and "recently" not in output
 
 
 def test_set_work_list_hash_inside_string_and_comments(tmp_path, monkeypatch):
@@ -269,3 +268,41 @@ def test_section_typo_detection_spares_unrelated_short_names():
     assert _typo_of("works") == "work"
     assert _typo_of("privcy") == "privacy"
     assert _typo_of("data") is None
+
+
+@pytest.mark.parametrize("text, key", [
+    ('[gate]\nenabled = "true"', "gate.enabled"),
+    ("[gate]\ntimeout_seconds = \"30\"", "gate.timeout_seconds"),
+    ("[gate]\ntrust_minutes = -1", "gate.trust_minutes"),
+    ("[audit]\nenabled = 1", "audit.enabled"),
+    ('[audit]\nretention_months = "12"', "audit.retention_months"),
+    ("[audit]\nretention_months = 0", "audit.retention_months"),
+])
+def test_gate_and_audit_values_are_type_checked(text, key):
+    s = Settings.from_toml(text)
+    assert len(s.problems) == 1 and s.problems[0].startswith(key)
+    assert not s.gate_enabled and not s.audit_enabled
+    assert s.gate_timeout_seconds == 30 and s.gate_trust_minutes == 10 and s.audit_retention_months == 12
+    assert not s.lockdown and s.profile == "personal"
+
+
+def test_gate_and_audit_opt_ins_and_work_always_asks_and_audits():
+    s = Settings.from_toml("[gate]\nenabled = true\n[audit]\nenabled = true\nretention_months = 3")
+    assert s.requires_approval and s.requires_audit and s.audit_retention_months == 3 and not s.problems
+    s = Settings.from_toml('[profile]\nactive = "work"\n[gate]\nenabled = false\n[audit]\nenabled = false')
+    assert s.requires_approval and s.requires_audit and not s.problems
+
+
+def test_a_non_table_audit_or_gate_is_reported_once():
+    for name in ("audit", "gate"):
+        s = Settings.from_toml(f"{name} = 5")
+        assert len(s.problems) == 1 and name in s.problems[0], s.problems
+        assert not s.gate_enabled and not s.audit_enabled
+
+
+def test_misspelt_audit_section_is_caught():
+    from argus.config import _typo_of
+
+    assert _typo_of("audti") == "audit" and _typo_of("audits") == "audit"
+    s = Settings.from_toml("[audti]\nenabled = true")
+    assert any("misspelt [audit]" in p for p in s.problems) and not s.audit_enabled

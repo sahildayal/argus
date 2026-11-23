@@ -61,15 +61,24 @@ def test_launchers_ignore_path(name, tmp_path, monkeypatch):
     assert gate_pipe._launchers(name) == {(scripts / f"{name}.exe").resolve(), (runtime / f"{name}.exe").resolve()}
 
 
-def test_mismatched_tray_versions_fail_closed():
-    """An old tray listens on a different pipe. A new tray rejects an old policy stamp."""
-    import dataclasses
-
+def test_no_tray_on_the_current_pipe_name_fails_closed():
+    """With nothing listening on this version's pipe name (no tray, or only an
+    older tray that listens on its own name), a work-profile request is refused
+    as tray_unavailable rather than sent."""
     from argus import gate, gate_pipe
     from argus.config import set_profile
 
     set_profile("work")
+    assert gate_pipe.probe() == "missing"
     assert gate.request("screenshot", (b"pixels",), ("text",)).reason == "tray_unavailable"
+
+
+def test_tray_rejects_a_request_from_an_older_server():
+    """A current tray parses the current request shape and refuses one from an
+    older server that sends the shorter (pre-marker) policy stamp."""
+    import dataclasses
+
+    from argus import gate, gate_pipe
 
     good = {f.name: None for f in dataclasses.fields(gate.Preview)}
     good.update(request_id="0" * 32, tool="screenshot", deadline=time.monotonic() + 30,
@@ -79,3 +88,20 @@ def test_mismatched_tray_versions_fail_closed():
     old = dict(good, stamp=good["stamp"][:2])
     with pytest.raises(ValueError):
         gate_pipe._parse(old)
+
+
+def test_probe_reports_whether_a_verified_tray_listens(monkeypatch):
+    """`argus status` / `doctor` probe: connects, verifies the server, sends nothing."""
+    from argus import gate_pipe
+
+    received = []
+    pipe = gate_pipe.PipeServer(lambda preview: received.append(preview) or "user")
+    pipe.start()
+    try:
+        assert gate_pipe.probe() == "unverified"  # this Python process isn't an Argus tray
+        monkeypatch.setattr(gate_pipe, "_is_tray", lambda process: process.pid == os.getpid())
+        assert gate_pipe.probe() == "verified"
+    finally:
+        pipe.close()
+    assert not received
+    assert gate_pipe.probe() == "missing"

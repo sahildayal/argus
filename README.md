@@ -123,9 +123,10 @@ layout is re-read on every call, so plugging and unplugging is fine.
 
 Images are sent at up to **2000 px** on the long side. A 1080p monitor goes
 through untouched, and long sessions full of screenshots stay inside the
-API's limits for requests with many images. Every capture is also saved as a
-full-resolution PNG (path in the reply) with its metadata embedded, so `zoom`
-can reopen it later by path.
+API's limits for requests with many images. Every capture that is sent is also
+saved as a full-resolution PNG (path in the reply) with its metadata embedded, so
+`zoom` can reopen it later by path. When approval is on, nothing is written to
+disk until you approve it: a denied or timed-out capture is never saved.
 
 ## Tray app and hotkeys
 
@@ -136,10 +137,20 @@ can reopen it later by path.
   uses it.
 - **Ctrl+Alt+P**: pause or resume Argus. While paused, every tool in every AI
   app refuses to capture (and the icon turns grey with a red slash).
-- Menu: pause for 15 minutes, switch between the personal and work profiles
-  (the tooltip shows which one is on), open captures/marks folders, edit settings.
+- **Approvals**: when approval is on (always in the work profile), the tray shows
+  the preview of each share and waits for **Send**, **Deny** or **Send & trust**
+  (see [Approve sharing from the tray](#privacy-and-security)). Without a running
+  tray, every capture that needs approval is refused.
+- Menu: **Pause captures**, **Pause for 15 minutes**, **Profile** (Personal /
+  Work; the tooltip shows which one is on), **Revoke trust** (ends any "Send &
+  trust" grant now), **Open captures folder**, **Open marks folder**, **Open
+  audit log folder**, **Edit settings** and **Quit Argus tray**.
 
-Change the hotkeys in `~/.argus/config.toml`, then restart the tray.
+The tooltip also warns when the work profile was kept on, when config.toml has
+problems, and when approvals are unavailable (the tray also shows a notification
+if its approval pipe can't start, usually because another Argus tray, such as
+an older version, is still running). Change the hotkeys in
+`~/.argus/config.toml`, then restart the tray.
 
 ## Privacy and security
 
@@ -190,6 +201,9 @@ deliberate choice:
   under its *current* settings: nothing from the personal profile, from before
   you changed the lists or upgraded the masker, or from a file Argus didn't
   write. Mark captions come from the sealed image, not the mark's JSON file.
+  In the work profile `zoom`, `read_text` and `find_text` only reopen Argus
+  capture ids or files inside `~/.argus/captures`, `marks` or `baselines`;
+  any other path is refused.
 
   Once switched on (tray, `argus profile work`, or `active = "work"` in the
   file), work **stays on** until you switch it off with the tray or `argus
@@ -200,7 +214,8 @@ deliberate choice:
   The work profile fails closed. A `config.toml` that doesn't parse, an
   unknown profile name, a setting of the wrong type or a broken regex in
   `[profile]`, `[privacy]` or `[work]`, or an unknown section that looks like
-  a misspelling of one of those or `[gate]` (`[profiles]`, `[privcy]`),
+  a misspelling of one of those or of `[gate]` / `[audit]` (`[profiles]`,
+  `[privcy]`, `[audti]`),
   switches to the work profile with nothing allowed until you fix it (`argus
   status` and the tray tooltip say what's wrong). Windows that might be
   drawing on top of an allowed one - see-through or click-through overlays,
@@ -209,7 +224,8 @@ deliberate choice:
   the rounded corners of allowed windows. An allowed window that is
   translucent (a layered window without a provable alpha of 255, including
   per-pixel-alpha windows) is blacked out whole, since what's behind it could
-  show through. Every work capture computes the redaction mask from the window
+  show through, and so is a shaped window (one with a window region) unless
+  Argus can prove it's opaque. Every work capture computes the redaction mask from the window
   list before and after grabbing the pixels; unless the two masks are
   identical, Argus retries and then refuses rather than risk a mask that
   doesn't match the pixels. It isn't perfect: a window that appears and
@@ -219,9 +235,19 @@ deliberate choice:
 - **Approve sharing from the tray.** In the work profile, the Argus tray queues
   requests from all MCP clients and shows one always-on-top preview at a time.
   Review the image and text tabs, then choose **Send**, **Deny** (or Esc), or
-  **Send & trust these windows for 10 min** where available. Enter leaves the
-  request pending. A timeout declines the share. If the tray is unavailable,
-  start or check `argus-tray` and retry.
+  **Send & trust** (trust these windows for `trust_minutes`, 10 by default)
+  where available. Send and Send & trust only arm a moment after the preview
+  gets focus, so a keystroke meant for another window can't approve it; Enter
+  leaves the request pending. A timeout declines the share. Nothing is saved
+  to disk until you approve: a denied or timed-out capture is discarded
+  (baselines are still saved locally when you ask for one). If approval is
+  unavailable, the AI is told so and the capture is refused: start or restart
+  `argus-tray`; if you upgraded Argus, quit the old tray first; if
+  `config.toml` has problems, `argus status` lists them. `argus status` also
+  says whether the tray's approval pipe is reachable and verified. If the
+  settings change while a request is in flight (you edit `config.toml`, pause,
+  or switch profiles), the call stops with "Argus settings changed during the
+  call; try again" (`settings_changed`).
 
   ```toml
   [gate]
@@ -241,12 +267,15 @@ deliberate choice:
   | `screenshot`, `look` | Review rendered images and all captions and leads. Live window scopes can use trust. |
   | `list_screens` | Review the exact inventory text each time. A paused status has no screen data. |
   | `latest_snip`, `latest_mark` | Review images and text each time. A saved or clipboard image has no live trust scope. |
-  | `zoom`, `read_text`, `find_text` | Review images and OCR text unless the source image was already shared by this MCP server under the current settings. Approving OCR text alone doesn't authorize the source image. |
+  | `zoom`, `read_text`, `find_text` | In the work profile, always a fresh review showing the exact crop or OCR text that would be sent, even when the source image was shared before. In personal with the gate on, a source image already shared by this MCP server under the current settings doesn't need a second review. Approving OCR text alone doesn't authorize the source image. |
   | `compare` | Review the diff and captions, including a text-only no-change result. A comparison can take one fresh frame. |
   | `wait_for` | Review once per consecutive window set. When the set changes, review the previous frame before the watch continues. Review the exact final result before it is sent. The watch clock stops during interim review. |
   | `save_baseline` | Save locally and return a receipt with the baseline name. |
 
-  The CLI still runs directly. Tray previews travel through a local Windows
+  In the work profile the CLI capture commands (`argus shot`, `look`, `zoom`,
+  `ocr`, `find`, `wait`, `baseline compare`, ...) go through the same tray
+  approval and audit log as MCP calls, so an AI agent that can run shell
+  commands can't use the CLI to get around the gate. Tray previews travel through a local Windows
   pipe restricted to the current user and scoped to their session. Argus checks the pipe
   server's process and user before sending anything. Software already running
   as your Windows user can still tamper with the tray, its files or its input.
@@ -259,22 +288,31 @@ deliberate choice:
     `tray_unavailable`, `denied`, `not_required`, `audit_failed`), app executable names
     only, image count, SHA-256 hashes of the exact image bytes sent (so an auditor can
     later verify whether a specific image was or wasn't sent, without storing it),
-    length of returned text in characters, request ID, MCP client name (if reported by
-    the client session), Argus version, and a tamper-evidence hash chain (`prev` = SHA-256
-    of the previous line, chaining across monthly files).
+    length of returned text in characters, request ID, the client (a canonical product
+    id such as `claude-code`, or `other:<hash>` for a client name Argus doesn't know, so
+    a client can't write arbitrary text into the log), Argus version, and a
+    tamper-evidence hash chain (`prev` = SHA-256 of the previous line, chaining across
+    monthly files).
   - **What is NEVER logged:** window titles, OCR text, file paths of captures,
     image pixels, or returned text content.
   - **Fail closed:** if audit logging is enabled and the audit file cannot be written,
     the gate decision fails closed (becomes `denied` with reason `audit_failed`), and
     an MCP error is returned saying the audit log could not be written.
   - **Tamper evidence:** `argus audit verify` checks the hash chain across files and reports
-    the first broken line. Note that this provides tamper evidence, not cryptographic
-    protection against local administrative users who could rewrite the history.
+    the first broken line, with a plain-language explanation of each problem. Argus also
+    records the newest entry in `audit/head.json`, so verify notices when entries are
+    missing from the end of the log (a truncated tail), and `audit/anchor.json` records
+    where retention pruned the chain, so a month deleted by hand is reported too. This is
+    tamper *evidence* that catches accidental loss and casual edits, not cryptographic
+    protection: anyone who can write files as you (or an administrator) could rewrite
+    the history, `head.json` included.
   - **Retention & management:** monthly audit files are kept for 12 months by default
     (`retention_months = 12` under `[audit]`) and cleaned up during the existing retention
     pass. Audit logs are not deleted by `argus cleanup --all` or capture retention.
-    Inspect entries with `argus audit`, filter with `argus audit --since 2026-11-01`, verify
-    with `argus audit verify`, or export with `argus audit export --out compliance.jsonl`.
+    Inspect entries with `argus audit` (newest 20; `-n 50`, `-n 0` for all), filter with
+    `argus audit --since 2026-11-01` (a UTC date; `-n` still applies), verify with
+    `argus audit verify`, or export with `argus audit export --out compliance.jsonl`
+    (`--since` works before or after `export`). All times in the log are UTC.
     The tray also includes an "Open audit log folder" menu item.
 - **Blacked out before anything leaves Argus:** password managers, WhatsApp,
   Signal, Telegram, Messenger, Phone Link, Windows notification toasts, and
@@ -315,35 +353,116 @@ argus baseline save login -w "localhost:3000"; argus baseline compare login
 argus pause --minutes 30; argus resume; argus status
 argus profile; argus profile work             # show / switch the privacy profile
 argus allow                                   # show the work allow list
-argus allow --learn                           # choose open/recent apps without showing their window titles
+argus allow --learn                           # pick from apps with windows open now; titles never shown
 argus allow add Code.exe WindowsTerminal.exe
 argus allow remove Code.exe
-argus allow add-title '^Jira'                  # match any window title
-argus allow add-title '\\blocalhost\\b' --browser # match browser tab titles
+argus allow add-title '^Jira'                 # match any window title
+argus allow add-title '\blocalhost\b' --browser   # match browser tab titles
 argus allow remove-title '^Jira'
-argus audit                                   # show last 20 gate decisions
-argus audit --since 2026-11-01               # show decisions since date
-argus audit verify                            # check hash chain for tampering
-argus audit export --out compliance.jsonl    # export audit log
+argus audit                                   # the newest 20 gate decisions (UTC)
+argus audit --since 2026-11-01 -n 50          # the newest 50 since a UTC date
+argus audit verify                            # check the hash chain for tampering
+argus audit export --out compliance.jsonl     # export the audit log
 ```
 
-`argus allow` edits the `[work]` lists in `~/.argus/config.toml`. Learning lists
-friendly app names and executable names only; it never captures a screenshot or
-prints window titles. Use `--browser` with `add-title` or `remove-title` for
-browser tab patterns.
+`argus allow` edits the `[work]` lists in `~/.argus/config.toml`. It adds and
+removes entries in the file as you wrote them (spelling, order and comments are
+kept), takes a lock so two edits at once can't undo each other, and refuses to
+write if the file changed meanwhile or if `config.toml` has any problem (it
+prints them; fix them first). Plain `argus allow` shows the lists as written,
+plus any config problems, and says when a lockdown makes them ineffective.
+Learn mode lists the friendly and executable names of apps that have windows
+open right now; it never captures a screenshot or prints window titles. Use
+`--browser` with `add-title` or `remove-title` for browser tab patterns. In
+PowerShell, single quotes keep a regex as typed (`'\blocalhost\b'`).
 
 ## Settings: `~/.argus/config.toml`
 
 Created with comments on first run. You can set the image size sent to the AI,
 the grid default, the mouse marker, how fresh a mark must be for `look`, the
-hotkeys, retention, the privacy profile and its block and allow lists. Changes
-apply on the next capture;
-hotkey changes need a tray restart.
+hotkeys, retention, the privacy profile and its block and allow lists, and:
+
+- `[gate]`: `timeout_seconds` (how long a preview waits, default 30) and
+  `trust_minutes` (how long **Send & trust** lasts, default 10). `enabled = true`
+  turns approvals on in the personal profile; the work profile always asks,
+  whatever it says.
+- `[audit]`: `retention_months` (default 12). `enabled = true` turns the audit
+  log on in the personal profile; the work profile always logs.
+
+Values are type-checked: a wrong type (say `enabled = "true"` instead of
+`enabled = true`) or an unknown key is reported by `argus status` and the
+default is used. Changes apply on the next capture; hotkey changes need a tray
+restart.
+
+## Recommended work setup
+
+For a workplace where screens can show patient or other regulated data:
+
+1. `argus profile work`, then `argus allow --learn` to pick the apps the AI may
+   see (or `argus allow add Code.exe ...`). Prefer apps over title patterns.
+2. Keep `argus-tray` in Startup (`argus install` adds it) and running: in the
+   work profile every share needs your approval in the tray, and without it
+   every capture is refused.
+3. Run `argus status` (or `argus doctor`): it should say the approval gate and
+   audit log are on, the approval pipe is reachable and verified, and there are
+   no config problems.
+4. Stop the AI tool from reading Argus's files or driving the CLI itself, so
+   the MCP tools (and their approvals) are the only way in. In Claude Code, add
+   deny rules to `~/.claude/settings.json` (example; adjust paths if you set
+   `ARGUS_HOME`):
+
+   ```json
+   {
+     "permissions": {
+       "deny": [
+         "Read(~/.argus/**)",
+         "Edit(~/.argus/**)",
+         "Bash(argus *)",
+         "Bash(argus-tray *)"
+       ]
+     }
+   }
+   ```
+
+   `Read`/`Edit` rules use gitignore-style paths (`~/` is your home folder);
+   `Bash(argus *)` blocks commands that start with `argus`. Bash rules match
+   command text, not intent, so they are a guard rail, not a sandbox: a command
+   written another way can still run. That's why the work profile also routes
+   CLI captures through the tray approval and the audit log, and refuses to
+   reopen files outside `~/.argus`. Other AI tools have similar permission
+   settings; check their documentation.
+5. Check the log now and then with `argus audit` and `argus audit verify`.
+
+What changes in the work profile, in short:
+
+- Only allowed apps are visible; everything else is blacked out without titles,
+  and shaped or translucent windows are blacked out unless provably opaque.
+- Every share is previewed in the tray; `zoom`, `read_text` and `find_text`
+  always ask again, showing the exact crop or text.
+- Captures are written to disk only after approval; denied or timed-out ones
+  are never saved. Baselines are saved only when you (or the AI) explicitly
+  save one.
+- CLI capture commands go through the same approval and audit log as MCP.
+- Only Argus capture ids and files inside `~/.argus/captures`, `marks` or
+  `baselines` can be reopened.
+- If settings change mid-call, the call stops with "Argus settings changed
+  during the call; try again" rather than sending a result made under the old
+  settings.
+- Every decision is logged with the client as a canonical id (or
+  `other:<hash>`), and `argus audit verify` also detects a truncated log tail
+  (accidental loss, not a determined local attacker).
 
 ## Troubleshooting
 
-- **Start with `argus doctor`.** It checks DPI awareness, monitors, OCR, the tray
-  and each registration.
+- **Start with `argus doctor`.** It checks DPI awareness, monitors, OCR, the
+  profile, the approval gate and audit log, whether the tray is running and its
+  approval pipe is reachable and verified, the Startup shortcut, config
+  problems and each registration. `argus status` shows the same approval, audit
+  and tray lines without the slower checks.
+- **"Approval is unavailable".** Start or restart `argus-tray`. If you upgraded
+  Argus, quit the old tray first (tray menu > Quit Argus tray): an older tray
+  listens on a different approval pipe. If `config.toml` has problems, see
+  `argus status`.
 - **The AI doesn't see Argus.** Start a new session. In Claude Code,
   `claude mcp get argus` should say *Connected*.
 - **A hotkey does nothing.** Another app may own it, in which case the tray shows
