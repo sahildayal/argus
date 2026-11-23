@@ -27,6 +27,8 @@ class Policy:
     paused: bool
     timeout: float
     trust_minutes: float
+    profile: str
+    requires_audit: bool
 
 
 def policy() -> Policy:
@@ -39,7 +41,8 @@ def policy() -> Policy:
     paused = privacy.pause_state().paused
     if before != stamp():
         raise GateStopped(UNAVAILABLE)
-    return Policy(before, s.requires_approval, paused, s.gate_timeout_seconds, s.gate_trust_minutes)
+    return Policy(before, s.requires_approval, paused, s.gate_timeout_seconds, s.gate_trust_minutes,
+                  s.profile, s.requires_audit)
 
 
 @dataclass(frozen=True)
@@ -129,13 +132,12 @@ def request(
         pass  # Never include the transport error or preview content in an MCP reply.
     apps = sorted({exe for _, exe, _ in windows or () if exe})
     decision = Decision(reason in ("user", "trusted", "not_required"), reason, tool, apps, time.time(), rid)
-    s = settings()
-    gate_enabled = current.enabled if current is not None else False
-    if s.requires_audit and (gate_enabled or reason != "not_required" or s.audit_enabled):
-        from . import audit
-
+    s = start if start is not None and start.requires_audit else current
+    if s is not None and s.requires_audit:
         try:
-            audit.log_decision(decision, shots=shots, text=text, profile=s.profile, client=client)
+            from . import audit
+
+            audit.log_decision(decision, shots=() if watching else shots, text=text, profile=s.profile, client=client)
         except Exception:
             decision = Decision(False, "audit_failed", tool, apps, decision.when, rid)
     return decision

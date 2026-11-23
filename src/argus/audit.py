@@ -7,7 +7,7 @@ import json
 import os
 import re
 import time
-from contextvars import ContextVar
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -30,15 +30,10 @@ try:
 except ImportError:
     _HAS_FCNTL = False
 
-_current_client: ContextVar[str | None] = ContextVar("audit_current_client", default=None)
-
-
-def set_current_client(name: str | None):
-    return _current_client.set(name)
-
-
-def get_current_client() -> str | None:
-    return _current_client.get()
+_MONTH = r"[0-9]{4}-(?:0[1-9]|1[0-2])"
+_MONTHLY_FILE = re.compile(rf"audit-({_MONTH})\.jsonl")
+_ANCHOR_FILE = "anchor.json"
+_PENDING_ANCHOR = "anchor.json.pending"
 
 
 def audit_dir() -> Path:
@@ -56,8 +51,10 @@ class AuditLock:
         self.fd: int | None = None
 
     def __enter__(self):
+        if not (_HAS_MSVCRT or _HAS_FCNTL):
+            raise RuntimeError("No OS audit lock is available.")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0))
         start = time.monotonic()
         while True:
             try:
@@ -88,49 +85,113 @@ class AuditLock:
                 self.fd = None
 
 
-def _get_last_line(path: Path) -> str | None:
-    """Read the last non-empty line of a file efficiently without loading the whole file."""
-    if not path.is_file() or path.stat().st_size == 0:
+def _monthly_files(base: Path) -> list[Path]:
+    return sorted(p for p in base.glob("audit-*.jsonl") if _MONTHLY_FILE.fullmatch(p.name) and p.is_file())
+
+
+def _parse_record(raw: bytes) -> dict | None:
+    line = raw.decode("utf-8", errors="replace")
+    if line.encode("utf-8") != raw:
         return None
+    try:
+        record = json.loads(line)
+    except (ValueError, RecursionError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _get_last_line(path: Path) -> tuple[bytes | None, bool]:
+    """Find the last valid record, reading backward in blocks past any damaged tail."""
+    recovered = False
     with open(path, "rb") as f:
-        f.seek(0, os.SEEK_END)
-        size = f.tell()
-        buf = bytearray()
-        block_size = 4096
-        pos = size
+        pos = f.seek(0, os.SEEK_END)
+        carry = b""
         while pos > 0:
-            step = min(block_size, pos)
+            step = min(4096, pos)
             pos -= step
             f.seek(pos)
-            chunk = f.read(step)
-            buf = bytearray(chunk) + buf
-            lines = buf.split(b"\n")
-            non_empty = [line.strip() for line in lines if line.strip()]
-            if non_empty and (pos == 0 or len(lines) > 2):
-                return non_empty[-1].decode("utf-8")
-        if buf.strip():
-            return buf.strip().decode("utf-8")
+            lines = (f.read(step) + carry).split(b"\n")
+            if pos:
+                carry = lines.pop(0)
+            for raw in reversed(lines):
+                line = raw.strip()
+                if line:
+                    if _parse_record(line) is not None:
+                        return line, recovered
+                    recovered = True
+    return None, recovered
+
+
+def _load_anchor(path: Path) -> dict | None:
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
         return None
+    anchor = _parse_record(raw)
+    if anchor is not None:
+        prev = anchor.get("prev_of_first_kept")
+        month = anchor.get("pruned_through")
+        ts = anchor.get("ts")
+        if (isinstance(prev, str) and re.fullmatch(r"genesis|[0-9a-f]{64}", prev)
+                and isinstance(month, str) and re.fullmatch(_MONTH, month)
+                and isinstance(ts, str) and ts.endswith("Z")):
+            return anchor
+    raise ValueError("Invalid audit pruning anchor.")
 
 
-def _find_prev_hash(target_file: Path, base_dir: Path) -> str:
-    """Find the SHA-256 hash of the previous line (current file, latest prior monthly file, or 'genesis')."""
-    if target_file.exists():
-        last = _get_last_line(target_file)
-        if last:
-            return hashlib.sha256(last.strip().encode("utf-8")).hexdigest()
+def _read_anchor(base: Path) -> dict | None:
+    """Resolve a prune interrupted between staging its anchor and committing it."""
+    pending_path = base / _PENDING_ANCHOR
+    pending = _load_anchor(pending_path)
+    if pending:
+        if (base / f"audit-{pending['pruned_through']}.jsonl").exists():
+            pending_path.unlink()
+        else:
+            pending_path.replace(base / _ANCHOR_FILE)
+    return _load_anchor(base / _ANCHOR_FILE)
 
-    prior_files = sorted(
-        [p for p in base_dir.glob("audit-*.jsonl") if p.is_file() and p.name < target_file.name],
-        key=lambda p: p.name,
-        reverse=True,
-    )
-    for pf in prior_files:
-        last = _get_last_line(pf)
-        if last:
-            return hashlib.sha256(last.strip().encode("utf-8")).hexdigest()
 
-    return "genesis"
+def _find_prev_hash(files: list[Path], anchor: dict | None) -> tuple[str, bool]:
+    recovered = False
+    for path in reversed(files):
+        last, damaged_tail = _get_last_line(path)
+        recovered = recovered or damaged_tail
+        if last is not None:
+            return hashlib.sha256(last).hexdigest(), recovered
+    return (anchor["prev_of_first_kept"] if anchor else "genesis"), recovered
+
+
+def _utc_stamp(now: datetime) -> str:
+    return now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _clean_client(name: str | None) -> str | None:
+    if name is None:
+        return None
+    cleaned = []
+    for ch in name:
+        if (ch.isprintable() and ch not in "\u034f\u115f\u1160\u17b4\u17b5\u3164\uffa0"
+                and not ("\u180b" <= ch <= "\u180f")
+                and not ("\ufe00" <= ch <= "\ufe0f" or "\U000e0100" <= ch <= "\U000e01ef")):
+            cleaned.append(ch)
+            if len(cleaned) == 64:
+                break
+    return "".join(cleaned)
+
+
+def _append_record(path: Path, record: dict) -> None:
+    line = (json.dumps(record, ensure_ascii=True) + "\n").encode("ascii")
+    fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0))
+    try:
+        if os.lseek(fd, 0, os.SEEK_END):
+            os.lseek(fd, -1, os.SEEK_END)
+            if os.read(fd, 1) != b"\n" and os.write(fd, b"\n") != 1:
+                raise OSError("Short write while repairing audit line ending.")
+        if os.write(fd, line) != len(line):
+            raise OSError("Short write while appending audit entry.")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def log_decision(
@@ -149,43 +210,45 @@ def log_decision(
     """
     base = dir_path or audit_dir()
     base.mkdir(parents=True, exist_ok=True)
-
-    now_utc = datetime.fromtimestamp(decision.when, timezone.utc)
-    month_str = now_utc.strftime("%Y-%m")
-    target_file = base / f"audit-{month_str}.jsonl"
-
-    client_name = client if client is not None else get_current_client()
+    sent_shots = shots if decision.approved else ()
+    hashes = [hashlib.sha256(b).hexdigest() for b in sent_shots if isinstance(b, (bytes, bytearray))]
 
     with AuditLock(base / ".lock"):
-        prev = _find_prev_hash(target_file, base)
+        now_utc = datetime.now(timezone.utc)
+        files = _monthly_files(base)
+        anchor = _read_anchor(base)
+        target_file = base / f"audit-{now_utc:%Y-%m}.jsonl"
+        if files:
+            target_file = max(target_file, files[-1])
+        elif anchor and f"{now_utc:%Y-%m}" <= anchor["pruned_through"]:
+            year, month = map(int, anchor["pruned_through"].split("-"))
+            year_delta, next_month = divmod(month, 12)
+            target_file = base / f"audit-{year + year_delta:04d}-{next_month + 1:02d}.jsonl"
+        prev, recovered = _find_prev_hash(files, anchor)
         record = {
-            "ts": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ts": _utc_stamp(now_utc),
             "profile": profile,
             "tool": decision.tool,
             "decision": "sent" if decision.approved else "denied",
             "reason": decision.reason,
             "apps": list(decision.apps),
-            "images": len(shots),
-            "image_sha256": [hashlib.sha256(b).hexdigest() for b in shots if isinstance(b, (bytes, bytearray))],
+            "images": len(hashes),
+            "image_sha256": hashes,
             "text_chars": sum(len(t) for t in text if isinstance(t, str)),
             "request_id": decision.request_id,
-            "client": client_name,
+            "client": _clean_client(client),
             "argus_version": __version__,
             "prev": prev,
         }
-        line = json.dumps(record, ensure_ascii=False) + "\n"
-        with open(target_file, "a", encoding="utf-8") as f:
-            f.write(line)
-            f.flush()
+        if recovered:
+            record["recovered"] = True
+        _append_record(target_file, record)
 
     return record
 
 
-def _matches_since(ts_str: str, since: str) -> bool:
-    since_clean = since.strip()
-    if len(since_clean) == 10:
-        return ts_str[:10] >= since_clean
-    return ts_str >= since_clean
+def _matches_since(ts: str, since: str) -> bool:
+    return (ts[:10] if len(since) == 10 else ts) >= since
 
 
 def read_entries(
@@ -194,27 +257,23 @@ def read_entries(
     limit: int | None = 20,
     dir_path: Path | None = None,
 ) -> list[dict]:
-    """Read audit entries in chronological order across monthly files."""
+    """Read audit entries in append order across monthly files."""
     base = dir_path or (home() / "audit")
     if not base.exists():
         return []
-    files = sorted([p for p in base.glob("audit-*.jsonl") if p.is_file()])
+    since = since.strip() if since else None
     entries = []
-    for f in files:
+    for path in _monthly_files(base):
         try:
-            with open(f, "r", encoding="utf-8") as in_f:
-                for line in in_f:
-                    stripped = line.strip()
-                    if not stripped:
+            with path.open("rb") as f:
+                for raw in f:
+                    data = _parse_record(raw.strip())
+                    if data is None:
                         continue
-                    try:
-                        data = json.loads(stripped)
-                    except Exception:
-                        continue
-                    if since and not _matches_since(data.get("ts", ""), since):
-                        continue
-                    entries.append(data)
-        except Exception:
+                    ts = data.get("ts")
+                    if not since or (isinstance(ts, str) and _matches_since(ts, since)):
+                        entries.append(data)
+        except OSError:
             continue
 
     if limit is not None and limit > 0 and len(entries) > limit and not since:
@@ -225,80 +284,95 @@ def read_entries(
 def verify_chain(dir_path: Path | None = None) -> tuple[bool, str]:
     """Check the tamper-evidence hash chain across all monthly audit files.
 
-    Reports the first broken line found. This is evidence, not cryptographic
-    protection against local administrative tampering.
+    Reports recovered crash fragments and the first broken hash link.
     """
     base = dir_path or (home() / "audit")
     if not base.exists():
         return True, "No audit logs found."
-    files = sorted([p for p in base.glob("audit-*.jsonl") if p.is_file()])
-    if not files:
-        return True, "No audit logs found."
+    try:
+        with AuditLock(base / ".lock"):
+            return _verify_locked(base)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return False, f"Could not verify audit log. {exc}"
 
-    expected_prev: str | None = None
+
+def _verify_locked(base: Path) -> tuple[bool, str]:
+    files = _monthly_files(base)
+    anchor = _read_anchor(base)
+    expected_prev = anchor["prev_of_first_kept"] if anchor else "genesis"
+    if anchor and files and files[0].name[6:13] <= anchor["pruned_through"]:
+        return False, "Invalid audit pruning anchor month for the retained files."
+    notices = [f"Audit logs pruned through {anchor['pruned_through']}."] if anchor else []
+    invalid_at = None
     total_entries = 0
-    files_checked = 0
 
-    for file_path in files:
-        files_checked += 1
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-        except Exception as exc:
-            return False, f"Could not read {file_path.name}: {exc}"
+    for path in files:
+        with path.open("rb") as f:
+            for line_no, raw in enumerate(f, start=1):
+                line = raw.strip()
+                if not line:
+                    continue
+                where = f"{path.name}:{line_no}"
+                data = _parse_record(line)
+                if data is None or not raw.endswith(b"\n"):
+                    notices.append(f"Warning: {path.name}: incomplete line {line_no} (crash?)")
+                if data is None:
+                    if raw.endswith(b"\n") and invalid_at is None:
+                        invalid_at = where
+                    continue
+                if invalid_at and data.get("recovered") is not True:
+                    return False, "\n".join([f"Chain broken at {invalid_at} (invalid JSON or UTF-8).", *notices])
+                invalid_at = None
+                if data.get("prev") != expected_prev:
+                    expected = "genesis prev" if expected_prev == "genesis" else f"prev {expected_prev}"
+                    return False, "\n".join([f"Chain broken at {where} (expected {expected}).", *notices])
+                expected_prev = hashlib.sha256(line).hexdigest()
+                total_entries += 1
 
-        for line_no, raw_line in enumerate(lines, start=1):
-            line_str = raw_line.strip()
-            if not line_str:
-                continue
-            total_entries += 1
-            try:
-                data = json.loads(line_str)
-            except Exception as exc:
-                return False, f"Chain broken at {file_path.name}:{line_no} (invalid JSON: {exc})"
-
-            actual_prev = data.get("prev")
-            if expected_prev is None:
-                if actual_prev != "genesis":
-                    return False, f"Chain broken at {file_path.name}:{line_no} (expected genesis prev, got {actual_prev!r})"
-            else:
-                if actual_prev != expected_prev:
-                    return False, f"Chain broken at {file_path.name}:{line_no} (expected prev {expected_prev}, got {actual_prev})"
-
-            expected_prev = hashlib.sha256(line_str.encode("utf-8")).hexdigest()
-
-    if total_entries == 0:
-        return True, "Audit log is empty."
-    return True, f"Verified {total_entries} entries across {files_checked} file(s): chain valid."
+    if invalid_at:
+        return False, "\n".join([f"Chain broken at {invalid_at} (invalid JSON or UTF-8).", *notices])
+    if not files:
+        summary = "No audit logs found."
+    elif not total_entries:
+        summary = "Audit log is empty."
+    else:
+        summary = f"Verified {total_entries} entries across {len(files)} file(s): chain valid."
+    return True, "\n".join([summary, *notices])
 
 
-def export_log(out_path: Path, *, since: str | None = None, dir_path: Path | None = None) -> int:
+def export_log(
+    out_path: Path, *, since: str | None = None, dir_path: Path | None = None,
+    report_skipped: Callable[[int], None] | None = None,
+) -> int:
     """Export audit entries to a single JSONL file for compliance."""
     base = dir_path or (home() / "audit")
     out_path = Path(out_path)
+    if (Path(os.path.abspath(out_path)).is_relative_to(Path(os.path.abspath(base)))
+            or out_path.resolve().is_relative_to(base.resolve())):
+        raise ValueError("Choose an export path outside the audit directory.")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if not base.exists():
-        out_path.write_text("", encoding="utf-8")
-        return 0
-
-    files = sorted([p for p in base.glob("audit-*.jsonl") if p.is_file()])
+    since = since.strip() if since is not None else None
     count = 0
-    with open(out_path, "w", encoding="utf-8") as out_f:
-        for f in files:
-            with open(f, "r", encoding="utf-8") as in_f:
+    skipped = 0
+    with out_path.open("wb") as out_f:
+        for path in _monthly_files(base):
+            with path.open("rb") as in_f:
                 for line in in_f:
                     stripped = line.strip()
                     if not stripped:
                         continue
-                    if since:
-                        try:
-                            data = json.loads(stripped)
-                            if not _matches_since(data.get("ts", ""), since):
-                                continue
-                        except Exception:
+                    if since is not None:
+                        data = _parse_record(stripped)
+                        ts = data.get("ts") if data is not None else None
+                        if not isinstance(ts, str):
+                            skipped += 1
                             continue
-                    out_f.write(stripped + "\n")
+                        if not _matches_since(ts, since):
+                            continue
+                    out_f.write(stripped + b"\n")
                     count += 1
+    if since is not None and report_skipped is not None:
+        report_skipped(skipped)
     return count
 
 
@@ -307,21 +381,39 @@ def cleanup_audit(retention_months: int = 12, dir_path: Path | None = None) -> i
     base = dir_path or (home() / "audit")
     if not base.exists():
         return 0
-    now_utc = datetime.now(timezone.utc)
     removed = 0
-    pattern = re.compile(r"^audit-(\d{4})-(\d{2})\.jsonl$")
-    for p in base.glob("audit-*.jsonl"):
-        m = pattern.match(p.name)
-        if not m:
-            continue
-        year, month = int(m.group(1)), int(m.group(2))
-        age_months = (now_utc.year - year) * 12 + (now_utc.month - month)
-        if age_months >= retention_months:
+    with AuditLock(base / ".lock"):
+        now_utc = datetime.now(timezone.utc)
+        anchor = _read_anchor(base)
+        prev = anchor["prev_of_first_kept"] if anchor else "genesis"
+        pending = base / _PENDING_ANCHOR
+        temp = base / "anchor.json.tmp"
+        for path in _monthly_files(base):
+            month_str = path.name[6:13]
+            year, month = map(int, month_str.split("-"))
+            age_months = (now_utc.year - year) * 12 + (now_utc.month - month)
+            if age_months <= retention_months:
+                break
             try:
-                p.unlink(missing_ok=True)
-                removed += 1
+                last, _ = _get_last_line(path)
             except OSError:
-                pass
+                break
+            if last is not None:
+                prev = hashlib.sha256(last).hexdigest()
+            anchor = {"prev_of_first_kept": prev, "pruned_through": month_str, "ts": _utc_stamp(now_utc)}
+            with temp.open("wb") as f:
+                f.write(json.dumps(anchor, ensure_ascii=True).encode("ascii") + b"\n")
+                f.flush()
+                os.fsync(f.fileno())
+            temp.replace(pending)
+            try:
+                path.unlink()
+            except OSError:
+                # Keep the anchor at the end of the contiguous pruned prefix.
+                pending.unlink()
+                break
+            pending.replace(base / _ANCHOR_FILE)
+            removed += 1
     return removed
 
 
