@@ -7,7 +7,7 @@ Thanks for helping. Bug reports, feature ideas and pull requests are all welcome
 ```powershell
 git clone https://github.com/sahildayal/argus
 cd argus
-uv sync                                   # creates .venv with Python 3.13 (uv-managed)
+uv sync                                   # creates .venv with Python 3.13 (a uv-managed one if installed, else a system one)
 uv tool install --editable . --managed-python --python 3.13   # optional: global argus / argus-mcp / argus-tray
 ```
 
@@ -54,6 +54,15 @@ change capture, OCR, tray or server code.
 | `store.py` | capture registry, background PNG writes |
 | `service.py` | everything the tools do; `server.py` (MCP), `cli.py` and `tray.py` are thin front ends |
 | `install.py` | registering with AI tools, startup shortcut, `doctor` |
+
+## Changing dependencies
+
+After editing `dependencies` in `pyproject.toml`, run `uv lock`, then
+`python scripts/export_constraints.py` and commit `constraints/requirements-lock.txt` with
+the lock. CI runs `python scripts/export_constraints.py --check` and fails when they
+disagree. The file is what [docs/enterprise-install.md](docs/enterprise-install.md) tells
+locked-down installs to pin against. `scripts/build_wheelhouse.py` builds the offline
+bundle from the same `uv.lock`.
 
 ## Releasing
 

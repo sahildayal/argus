@@ -1,0 +1,3 @@
+# The exported lock is compared byte-for-byte in CI (scripts/export_constraints.py --check),
+# so keep LF on every checkout, including Windows runners with core.autocrlf.
+constraints/requirements-lock.txt text eol=lf
