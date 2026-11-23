@@ -197,3 +197,11 @@ def test_set_work_list_hash_inside_string_and_comments(tmp_path, monkeypatch):
     assert "# keep me" in text and 'pattern"]' not in text
     assert [p.pattern for p in s.allow_titles] == ["C# notes", "x"]
     assert s.allow_apps == frozenset({"code.exe"})
+
+
+def test_section_typo_detection_spares_unrelated_short_names():
+    from argus.config import _typo_of
+    assert _typo_of("profiles") == "profile"
+    assert _typo_of("works") == "work"
+    assert _typo_of("privcy") == "privacy"
+    assert _typo_of("data") is None

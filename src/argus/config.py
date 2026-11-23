@@ -197,19 +197,25 @@ _TYPO_DISTANCE = 2
 
 
 def _distance(a: str, b: str) -> int:
-    """Levenshtein edit distance."""
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        cur = [i]
-        for j, cb in enumerate(b, 1):
-            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
-        prev = cur
-    return prev[-1]
+    """Edit distance counting an adjacent swap ("wrok") as one edit (optimal string alignment)."""
+    d = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    for i in range(len(a) + 1):
+        d[i][0] = i
+    for j in range(len(b) + 1):
+        d[0][j] = j
+    for i in range(1, len(a) + 1):
+        for j in range(1, len(b) + 1):
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] != b[j - 1]))
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+    return d[-1][-1]
 
 
 def _typo_of(section: str) -> str | None:
     name = section.strip().lower()
-    hits = [(d, t) for t in _TYPO_TARGETS if (d := _distance(name, t)) <= _TYPO_DISTANCE]
+    # Short names ("work", "gate") only tolerate one edit, or unrelated sections like [data] would match.
+    hits = [(d, t) for t in _TYPO_TARGETS
+            if (d := _distance(name, t)) <= (1 if len(t) <= 4 else _TYPO_DISTANCE)]
     return min(hits)[1] if hits else None
 
 
