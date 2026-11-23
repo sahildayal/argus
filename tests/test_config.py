@@ -135,3 +135,49 @@ def test_cli_profile_command(argus_home, capsys):
     out = capsys.readouterr().out
     assert "Switched to the work profile" in out and "Nothing is allowed yet" in out
     assert config.settings().work
+
+
+def test_set_work_list_preserves_comments_crlf_and_multiline(argus_home):
+    path = argus_home / "config.toml"
+    argus_home.mkdir(parents=True, exist_ok=True)
+    original = '# note\r\n[work] # section\r\nallow_apps = [\r\n  "Code.exe", # keep this\r\n]\r\nallow_titles = []\r\n'
+    path.write_bytes(original.encode())
+    config.set_work_list("allow_apps", ["Code.exe", "Terminal.EXE", "terminal.exe"])
+    changed = path.read_bytes().decode()
+    assert "# note\r\n[work] # section\r\n" in changed and "# keep this" in changed
+    assert "\r\n" in changed and config.settings().allow_apps == {"code.exe", "terminal.exe"}
+
+
+def test_set_work_list_creates_missing_section_and_key(argus_home):
+    path = argus_home / "config.toml"
+    argus_home.mkdir(parents=True, exist_ok=True)
+    path.write_text("# note\n[capture]\nmax_side = 900\n", encoding="utf-8")
+    config.set_work_list("allow_apps", ["Code.exe"])
+    assert config.settings().allow_apps == {"code.exe"}
+    assert "[work]\nallow_apps = [\"Code.exe\"]" in path.read_text(encoding="utf-8")
+
+
+def test_set_work_list_rejects_invalid_values(argus_home):
+    with pytest.raises(ValueError, match=r"\.exe"):
+        config.set_work_list("allow_apps", ["Code"])
+    with pytest.raises(ValueError, match="regex"):
+        config.set_work_list("allow_titles", ["("])
+
+
+def test_allow_learn_never_prints_window_titles(argus_home, monkeypatch, capsys):
+    from types import SimpleNamespace
+    from argus import cli
+    from conftest import desk, mon, win
+
+    windows = [win(1, "Doe, John (MRN 12345)", app="Editor", process="Editor.exe"),
+               win(2, "SECRET TAB", app="Browser", process="browser.exe")]
+    fake_desk = desk([mon(1, 0, 0, 800, 600)], windows)
+    monkeypatch.setattr("argus.desktop.snapshot", lambda *_: fake_desk)
+    tracker = SimpleNamespace(recent=lambda: [], stop=lambda: None)
+    monkeypatch.setattr("argus.service.Tracker", lambda: SimpleNamespace(start=lambda: tracker))
+    answers = iter(["2", "y"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    assert cli.main(["allow", "--learn"]) == 0
+    output = capsys.readouterr().out
+    assert "Doe" not in output and "MRN" not in output and "SECRET TAB" not in output
+    assert "Editor.exe" in output and config.settings().allow_apps == {"editor.exe"}

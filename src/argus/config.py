@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import tomllib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -239,6 +240,101 @@ def set_profile(name: str) -> Settings:
         os.replace(tmp, path)
         _cache = None
     return settings()
+
+
+WORK_LIST_KEYS = {"allow_apps", "allow_browser_titles", "allow_titles"}
+
+
+def set_work_list(key: str, values) -> Settings:
+    """Atomically replace one [work] array while preserving all other TOML text."""
+    global _cache
+    if key not in WORK_LIST_KEYS:
+        raise ValueError(f"unknown work list {key!r}")
+    values = list(dict.fromkeys(str(v) for v in values))
+    if key == "allow_apps":
+        if any(not v.lower().endswith(".exe") for v in values):
+            raise ValueError("app names must end with .exe")
+        values = list({v.lower(): v for v in values}.values())
+    else:
+        for value in values:
+            try:
+                re.compile(value)
+            except re.error as exc:
+                raise ValueError(f"invalid regex {value!r}: {exc}") from None
+    settings()
+    path = config_path()
+    with _lock:
+        with open(path, encoding="utf-8", newline="") as f:
+            original = f.read()
+        new = _with_work_list(original, key, values)
+        try:
+            parsed = tomllib.loads(new)
+            result = Settings.from_toml(new)
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(f"{path} isn't valid TOML ({exc}); fix it first") from None
+        expected = {"allow_apps": result.allow_apps,
+                    "allow_browser_titles": tuple(p.pattern for p in result.allow_browser_titles),
+                    "allow_titles": tuple(p.pattern for p in result.allow_titles)}[key]
+        expected_values = frozenset(v.lower() for v in values) if key == "allow_apps" else tuple(values)
+        if expected != expected_values:
+            raise ValueError(f"couldn't verify [work] {key} in {path}")
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(new, encoding="utf-8", newline="")
+        os.replace(tmp, path)
+        _cache = None
+    return settings()
+
+
+def _with_work_list(text: str, key: str, values: list[str]) -> str:
+    lines = text.splitlines(keepends=True)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    header = next((i for i, line in enumerate(lines) if (m := _SECTION.match(line)) and m.group(1).strip() == "work"), None)
+    encoded = "[" + ", ".join(json.dumps(v, ensure_ascii=False) for v in values) + "]"
+    if header is None:
+        sep = "" if not text or text.endswith("\n") else newline
+        return f"{text}{sep}{newline}[work]{newline}{key} = {encoded}{newline}"
+    end = next((i for i in range(header + 1, len(lines)) if _SECTION.match(lines[i])), len(lines))
+    matcher = re.compile(rf"^(\s*{re.escape(key)}\s*=\s*)(\[)")
+    for i in range(header + 1, end):
+        body = lines[i].rstrip("\r\n")
+        match = matcher.match(body)
+        if not match:
+            continue
+        # Arrays may span lines. Locate the matching bracket while respecting quoted strings.
+        depth, quote, escaped, finish = 1, None, False, None
+        for j in range(i, end):
+            row = lines[j].rstrip("\r\n")
+            start = match.end(2) if j == i else 0
+            for k in range(start, len(row)):
+                ch = row[k]
+                if quote:
+                    if escaped: escaped = False
+                    elif ch == "\\": escaped = True
+                    elif ch == quote: quote = None
+                elif ch in "\"'": quote = ch
+                elif ch == "[": depth += 1
+                elif ch == "]":
+                    depth -= 1
+                    if depth == 0:
+                        finish = (j, k + 1)
+                        break
+            if finish: break
+        if not finish: raise ValueError(f"unterminated [work] {key} array")
+        j, k = finish
+        suffix = lines[j].rstrip("\r\n")[k:]
+        comments = []
+        for old_line in lines[i:j + 1]:
+            comment = re.search(r"\s+#.*$", old_line.rstrip("\r\n"))
+            if comment:
+                comments.append(comment.group().lstrip())
+        replacement = [body[:match.start(2)] + encoded + suffix + (lines[j][len(lines[j].rstrip("\r\n")):])]
+        replacement.extend(f"# {comment.lstrip('# ').rstrip()}{newline}" for comment in comments)
+        lines[i:j + 1] = replacement
+        return "".join(lines)
+    if end > header + 1 and not lines[end - 1].endswith("\n"):
+        lines[end - 1] += newline
+    lines.insert(end, f"{key} = {encoded}{newline}")
+    return "".join(lines)
 
 
 _SECTION = re.compile(r"^\s*\[([^\[\]]+)\]\s*(#.*)?$")
