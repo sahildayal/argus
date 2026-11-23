@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import queue
 import threading
 import time
@@ -13,9 +14,15 @@ from tkinter import ttk
 
 from PIL import Image, ImageTk
 
-from . import gate, win32
+from . import gate, privacy, win32
+from .config import settings
+from .desktop import NO_HOST, snapshot
+from .geometry import Rect
+from .text import display_arg
 
 log = logging.getLogger("argus.tray")
+_ARM_MS = 750
+_PROMPT_GAP = 0.3
 
 
 @dataclass
@@ -36,6 +43,11 @@ class Approvals:
         self.queue: queue.Queue[_Pending] = queue.Queue()
         self.active: _Pending | None = None
         self.window: tk.Toplevel | None = None
+        self._arm_job: str | None = None
+        self._deadline_job: str | None = None
+        self._armed = False
+        self._next_prompt = 0.0
+        self._offset = 0
 
     def answer(self, preview: gate.Preview) -> str:
         pending = _Pending(preview)
@@ -55,6 +67,8 @@ class Approvals:
                     self._finish("denied")
                 else:
                     return
+            if time.monotonic() < self._next_prompt:
+                return
             while not self.queue.empty():
                 self.active = self.queue.get_nowait()
                 preview = self.active.preview
@@ -72,9 +86,15 @@ class Approvals:
             self._finish("tray_unavailable")
 
     def _finish(self, reason: str) -> None:
+        self._disarm()
+        if self._deadline_job is not None:
+            self.root.after_cancel(self._deadline_job)
+            self._deadline_job = None
         if self.window is not None:
             self.window.destroy()
             self.window = None
+            self._next_prompt = time.monotonic() + _PROMPT_GAP
+            self._offset = 20 - self._offset
         if self.active is not None:
             self.active.finish(reason)
             self.active = None
@@ -85,7 +105,7 @@ class Approvals:
             self.queue.get_nowait().finish("tray_unavailable")
 
     def _send(self, trust: bool) -> None:
-        if self.active is None:
+        if self.active is None or not self._armed:
             return
         try:
             preview = self.active.preview
@@ -96,9 +116,7 @@ class Approvals:
             if not self.trust.valid(preview, current):
                 self._finish("denied")
                 return
-            if trust:
-                self.trust.grant(preview, current)
-            self._finish("user")
+            self._finish("denied" if trust and not self.trust.grant(preview, current) else "user")
         except (OSError, ValueError, gate.GateStopped):
             self._finish("tray_unavailable")
 
@@ -107,8 +125,10 @@ class Approvals:
         top.withdraw()
         top.title("Argus approval")
         top.attributes("-topmost", True)
-        top.geometry("740x500")
-        top.minsize(480, 310)
+        work = _work_area(top)
+        width, height = int(work.w * 0.7), int(work.h * 0.7)
+        top.geometry(f"{width}x{height}")
+        top.minsize(min(width, 480), min(height, 330))
         top.protocol("WM_DELETE_WINDOW", lambda: self._finish("denied"))
         top.bind("<Escape>", lambda _event: self._finish("denied"))
         top.bind("<Return>", lambda _event: "break")
@@ -124,57 +144,217 @@ class Approvals:
         ttk.Label(top, text=f"Share with the AI via {preview.tool}?", font=("Segoe UI", 13, "bold")).pack(
             anchor="w", padx=12, pady=(12, 4)
         )
+        requested = display_arg(preview.query)
+        characters = sum(map(len, preview.text))
+        if requested:
+            characters += len(gate.QUERY_LABEL) + 2 + len(requested)
+        count = len(preview.images)
+        ttk.Label(top, text=f"{count} {'image' if count == 1 else 'images'} + {characters} characters of text, tool: {preview.tool}").pack(
+            anchor="w", padx=12, pady=(0, 6)
+        )
         if preview.watching:
             ttk.Label(
                 top, text="The window set changed. Approve this earlier frame for use in the watch. The final result is reviewed separately.",
-                wraplength=690,
+                wraplength=max(1, width - 24),
             ).pack(anchor="w", padx=12, pady=(0, 6))
 
         buttons = ttk.Frame(top, padding=12)
         buttons.pack(side="bottom", fill="x")
         deny = ttk.Button(buttons, text="Deny", command=lambda: self._finish("denied"))
         deny.pack(side="right", padx=(6, 0))
-        ttk.Button(buttons, text="Send", command=lambda: self._send(False)).pack(side="right", padx=(6, 0))
-        if preview.windows and preview.tool != "list_screens":
-            ttk.Button(buttons, text=f"Send & trust these windows for {minutes:g} min", command=lambda: self._send(True)).pack(
-                side="right"
-            )
-        for button in buttons.winfo_children():
+        send = ttk.Button(buttons, text="Send", takefocus=False, state="disabled", command=lambda: self._send(False))
+        send.pack(side="right", padx=(6, 0))
+        approvals = [send]
+        if preview.allow_trust and preview.windows:
+            trust = ttk.Button(buttons, text="Send & trust", takefocus=False, state="disabled", command=lambda: self._send(True))
+            trust.pack(side="right", padx=(6, 0))
+            approvals.append(trust)
+            labels = _trust_labels(preview.windows)
+            scope = ttk.Frame(buttons)
+            scope.pack(side="left", fill="both", expand=True)
+            _text_panel(scope, f"Trust for {minutes:g} min: {', '.join(labels)}", height=2, width=1)
+        for button in [deny, *approvals]:
             button.bind("<Return>", lambda _event: "break")
             button.bind("<KP_Enter>", lambda _event: "break")
+        for button in approvals:
+            button.bind("<space>", lambda _event: "break")
 
-        notebook = ttk.Notebook(top)
-        notebook.pack(fill="both", expand=True, padx=12)
-        for index, encoded in enumerate(preview.images, 1):
-            tab = ttk.Frame(notebook)
-            notebook.add(tab, text=f"Image {index}")
-            with Image.open(io.BytesIO(encoded)) as image:
-                photo = ImageTk.PhotoImage(image, master=tab)
-            canvas = tk.Canvas(tab, highlightthickness=0, scrollregion=(0, 0, photo.width(), photo.height()))
-            _scrollable(tab, canvas)
-            canvas.create_image(0, 0, anchor="nw", image=photo)
-            canvas.photo = photo
+        if requested:
+            query = ttk.LabelFrame(top, text=gate.QUERY_LABEL, padding=(8, 4))
+            query.pack(fill="x", padx=12, pady=(0, 6))
+            ttk.Label(query, text=requested, wraplength=max(1, width - 48)).pack(anchor="w")
+
+        panes = ttk.Panedwindow(top, orient="horizontal", takefocus=False)
+        panes.pack(fill="both", expand=True, padx=12)
+        if preview.images:
+            images = ttk.Frame(panes, width=int(width * 0.57))
+            panes.add(images, weight=3)
+            _image_panel(images, preview.images)
         if preview.text:
-            tab = ttk.Frame(notebook)
-            notebook.add(tab, text="Text")
-            widget = tk.Text(tab, wrap="word", font=("Segoe UI", 10), padx=8, pady=8)
-            widget.insert("1.0", "\n\n".join(preview.text))
-            widget.configure(state="disabled")
-            _scrollable(tab, widget, horizontal=False)
+            body = ttk.Frame(panes)
+            panes.add(body, weight=2)
+            _text_panel(body, "\n\n".join(preview.text), width=max(1, width // 26))
+
+        def enable() -> None:
+            self._arm_job = None
+            focused = top.focus_displayof()
+            if focused is not None and focused.winfo_toplevel() is top:
+                self._armed = True
+                for button in approvals:
+                    button.state(["!disabled"])
+
+        def on_focus(event: tk.Event) -> None:
+            if event.widget is not top:
+                return
+            self._disarm()
+            for button in approvals:
+                button.state(["disabled"])
+            if event.type == tk.EventType.FocusIn:
+                self._arm_job = self.root.after(_ARM_MS, enable)
+
+        top.bind("<FocusIn>", on_focus)
+        top.bind("<FocusOut>", on_focus)
+        deny.bind("<Map>", lambda _event: deny.focus_set())
         top.deiconify()
+        x = work.x + (work.w - width) // 2 + self._offset
+        y = work.y + (work.h - height) // 2 + self._offset
+        win32.SetWindowPos(hwnd, None, x, y, 0, 0, 0x15)  # keep size, Z order and activation
         top.lift()
-        deny.focus_set()
+        delay = max(0, math.ceil((preview.deadline - time.monotonic()) * 1000))
+        self._deadline_job = self.root.after(delay, lambda: self._finish("timeout"))
+
+    def _disarm(self) -> None:
+        self._armed = False
+        if self._arm_job is not None:
+            self.root.after_cancel(self._arm_job)
+            self._arm_job = None
+
+
+def _work_area(top: tk.Toplevel) -> Rect:
+    cursor = win32.cursor_pos()
+    monitors = win32.monitors_raw()
+    for _, _, bounds, work, _, _ in monitors:
+        if bounds.contains(*cursor):
+            return work
+    return next((work for _, _, _, work, primary, _ in monitors if primary),
+                Rect(0, 0, top.winfo_screenwidth(), top.winfo_screenheight()))
+
+
+def _trust_labels(windows: privacy.WindowSet) -> list[str]:
+    s = settings()
+    names = {
+        privacy.window_identity(w): (w.process, w.title)
+        for w in snapshot(NO_HOST).layers if privacy.shown(w, s)
+    }
+    labels = []
+    for hwnd, exe, pid in sorted(windows, key=lambda window: (window[1], window[0])):
+        name, title = names.get((hwnd, exe, pid), (exe, ""))
+        label = display_arg(name) or "Unknown app"
+        title = display_arg(title)
+        labels.append(f"{label} — {title}" if title else label)
+    return labels
+
+
+def _text_panel(parent: ttk.Frame, text: str, **size: int) -> None:
+    widget = tk.Text(parent, wrap="word", takefocus=False, font=("Segoe UI", 10), padx=6, pady=4, **size)
+    widget.insert("1.0", text)
+    widget.configure(state="disabled")
+    _scrollable(parent, widget, horizontal=False)
+
+
+def _image_panel(parent: ttk.Frame, encoded: tuple[bytes, ...]) -> None:
+    images = []
+    for data in encoded:
+        with Image.open(io.BytesIO(data)) as image:
+            images.append(image.copy())
+
+    controls = ttk.Frame(parent)
+    controls.pack(fill="x")
+    gallery = ttk.Button(controls, text="All images", takefocus=False)
+    zoom = ttk.Button(controls, text="100%", takefocus=False)
+    for button in (gallery, zoom):
+        button.bind("<space>", lambda _event: "break")
+    selected = 0 if len(images) == 1 else None
+    actual_size = False
+    frame = ttk.Frame(parent)
+    frame.pack(fill="both", expand=True)
+    canvas = tk.Canvas(frame, highlightthickness=0, takefocus=False)
+    _scrollable(frame, canvas)
+    photos = []
+
+    def draw(_event=None) -> None:
+        canvas.delete("all")
+        photos.clear()
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        if selected is not None:
+            image = images[selected]
+            if not actual_size:
+                image = _fit(image, width, height)
+            photo = ImageTk.PhotoImage(image, master=canvas)
+            photos.append(photo)
+            canvas.create_image(max(0, (width - photo.width()) // 2), max(0, (height - photo.height()) // 2),
+                                image=photo, anchor="nw")
+            canvas.configure(scrollregion=(0, 0, max(width, photo.width()), max(height, photo.height())))
+            return
+
+        cols = math.ceil(math.sqrt(len(images)))
+        rows = math.ceil(len(images) / cols)
+        cell_w, cell_h = width / cols, height / rows
+        for i, image in enumerate(images):
+            x, y = (i % cols + 0.5) * cell_w, (i // cols) * cell_h
+            photo = ImageTk.PhotoImage(_fit(image, int(cell_w) - 8, int(cell_h) - 25), master=canvas)
+            photos.append(photo)
+            tag = f"thumbnail-{i}"
+            canvas.create_image(x, y + (cell_h - 20) / 2, image=photo, tags=tag)
+            canvas.create_text(x, y + cell_h - 10, text=f"Image {i + 1}", tags=tag)
+        canvas.configure(scrollregion=(0, 0, width, height))
+
+    def select(index: int | None) -> None:
+        nonlocal selected, actual_size
+        selected, actual_size = index, False
+        gallery.state(["disabled" if index is None else "!disabled"])
+        zoom.state(["disabled" if index is None else "!disabled"])
+        zoom.configure(text="100%")
+        redraw_from_origin()
+
+    def toggle_zoom() -> None:
+        nonlocal actual_size
+        actual_size = not actual_size
+        zoom.configure(text="Fit" if actual_size else "100%")
+        redraw_from_origin()
+
+    def redraw_from_origin() -> None:
+        draw()
+        canvas.xview_moveto(0)
+        canvas.yview_moveto(0)
+
+    if len(images) > 1:
+        gallery.configure(command=lambda: select(None))
+        gallery.pack(side="left")
+        for i in range(len(images)):
+            canvas.tag_bind(f"thumbnail-{i}", "<Button-1>", lambda _event, index=i: select(index))
+    zoom.configure(command=toggle_zoom)
+    zoom.pack(side="left")
+    canvas.bind("<Configure>", draw)
+    select(selected)
+
+
+def _fit(image: Image.Image, width: int, height: int) -> Image.Image:
+    scale = min(1, max(1, width) / image.width, max(1, height) / image.height)
+    if scale == 1:
+        return image
+    return image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))), Image.Resampling.LANCZOS)
 
 
 def _scrollable(parent: ttk.Frame, widget, *, horizontal: bool = True) -> None:
     parent.columnconfigure(0, weight=1)
     parent.rowconfigure(0, weight=1)
     widget.grid(row=0, column=0, sticky="nsew")
-    y = ttk.Scrollbar(parent, orient="vertical", command=widget.yview)
+    y = ttk.Scrollbar(parent, orient="vertical", takefocus=False, command=widget.yview)
     y.grid(row=0, column=1, sticky="ns")
     widget.configure(yscrollcommand=y.set)
     if horizontal:
-        x = ttk.Scrollbar(parent, orient="horizontal", command=widget.xview)
+        x = ttk.Scrollbar(parent, orient="horizontal", takefocus=False, command=widget.xview)
         x.grid(row=1, column=0, sticky="ew")
         widget.configure(xscrollcommand=x.set)
     widget.bind("<MouseWheel>", lambda e: widget.yview_scroll(-e.delta // 120, "units"))

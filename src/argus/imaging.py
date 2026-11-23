@@ -11,6 +11,8 @@ from functools import lru_cache
 
 from PIL import Image, ImageDraw, ImageFont
 
+from .text import display_arg
+
 # PNG keeps text crisp; past this size a high-quality JPEG is sent instead.
 PNG_BUDGET = 1_200_000
 
@@ -53,12 +55,12 @@ class Grid:
         """'D7' or 'C3:E5' -> (x0, y0, x1, y1) in view pixels."""
         parts = [p.strip() for p in spec.split(":")]
         if not 1 <= len(parts) <= 2:
-            raise ValueError(f"bad cell {spec!r}")
+            raise ValueError(f"bad cell {display_arg(spec)!r}")
         boxes = []
         for part in parts:
             m = re.fullmatch(r"([A-Za-z]{1,2})\s*(\d{1,3})", part)
             if not m:
-                raise ValueError(f'bad cell {part!r} - use a column letter and row number, like "D7"')
+                raise ValueError(f'bad cell {display_arg(part)!r} - use a column letter and row number, like "D7"')
             col, row = column_index(m.group(1)), int(m.group(2)) - 1
             if not (0 <= col < self.cols and 0 <= row < self.rows):
                 last = f"{column_name(self.cols - 1)}{self.rows}"

@@ -21,6 +21,7 @@ from .looking import ago, choose, host_label
 from .marks import recent_marks
 from .snips import latest as latest_snips, screenshots_dir
 from .store import Capture, Store, open_file
+from .text import display_arg
 
 
 @dataclass
@@ -31,6 +32,8 @@ class Result:
     mark_id: str | None = None
     screen_derived: bool = True
     window_scope: privacy.WindowSet | None = None
+    allow_trust: bool = True
+    query: str = ""
 
     def text(self, *lines: str) -> Result:
         self.parts.append("\n".join(line for line in lines if line))
@@ -227,7 +230,7 @@ class Session:
         if choice.host is not None:
             extra.append(choice.host)
         if shot.share_windows is not None:
-            shot.share_windows |= privacy.share_scope(desk, s, extra)
+            result.allow_trust = privacy.named_windows([win, *extra], s) <= shot.share_windows
         self._show(result, [shot], grid)
         return result.text(*footer)
 
@@ -331,7 +334,7 @@ class Session:
             lines.append(f"On the privacy list (blacked out in captures): {', '.join(hidden)}.")
         for problem in s.problems:
             lines.append(f"Config problem: {problem}")
-        scope = privacy.share_scope(desk, s, desk.windows) if s.requires_approval else None
+        scope = privacy.named_windows(desk.windows, s) if s.requires_approval else None
         return Result(window_scope=scope).text(*lines)
 
     @staticmethod
@@ -436,16 +439,16 @@ class Session:
         found: list[tuple[Capture, ocr.Match]] = []
         first_lines: list[ocr.Line] = []
         caps = await self._ocr_targets(monitor, window, region, capture_id)
-        result = Result(sources=caps)
+        result = Result(sources=caps, query=display_arg(text))
         for cap in caps:
             lines = await ocr.read(cap.image)
             first_lines = first_lines or lines
             found.extend((cap, m) for m in ocr.find(lines, text))
         if not found:
             sample = "; ".join(ln.text for ln in first_lines[:12]) or "nothing legible"
-            return result.text(f'"{text}" is not on screen (OCR). Text it did read includes: {sample}.')
+            return result.text(f"No matches on screen (OCR). Text it did read includes: {sample}.")
         found.sort(key=lambda cm: -cm[1].score)
-        lines = [f'Found "{text}" {len(found)} time(s):']
+        lines = [f"Found {len(found)} {'match' if len(found) == 1 else 'matches'}:"]
         for i, (cap, m) in enumerate(found[:10], 1):
             sc = cap.view.scale
             x0, y0, x1, y1 = (round(v * sc) for v in m.box)
@@ -466,7 +469,7 @@ class Session:
         bx1, by1 = min(img.width, int(best.box[2]) + pad), min(img.height, int(best.box[3]) + pad)
         origin = (cap.shot.origin[0] + bx0, cap.shot.origin[1] + by0) if cap.shot.origin else None
         crop = Shot(
-            image=img.crop((bx0, by0, bx1, by1)), kind="zoom", label=f'best match for "{text}" (from {cap.id})',
+            image=img.crop((bx0, by0, bx1, by1)), kind="zoom", label=f"best OCR match (from {cap.id})",
             origin=origin, target={}, method="crop", cursor=cap.shot.cursor, taken=cap.shot.taken,
             profile=cap.shot.profile,
             share_windows=cap.shot.share_windows,
@@ -487,10 +490,11 @@ class Session:
             return Result(screen_derived=False).text(f"Saved baseline {path.stem!r}.")
         cap = self.register(shot, grid=False, save=False)
         w, h = shot.image.size
+        shown_name = display_arg(name)
         return Result().text(
-            f"Saved baseline {name!r}: {shot.label}, {w}x{h} [{cap.id}].",
+            f"Saved baseline {shown_name!r}: {shot.label}, {w}x{h} [{cap.id}].",
             f"File: {path}",
-            f'Later, compare(baseline="{name}") re-captures the same target and boxes what changed.',
+            f'Later, compare(baseline="{path.stem}") re-captures the same target and boxes what changed.',
         )
 
     def compare(self, baseline: str | None = None, capture_a: str | None = None, capture_b: str | None = None,
@@ -500,16 +504,16 @@ class Session:
             before = testing.load_baseline(baseline)
             _require_profile(before, s)
             after = recapture(self.desk(), s, before.target)
-            name_before = f"baseline {baseline!r} (saved {ago(time.time() - before.taken)} ago)"
+            name_before = f"baseline {display_arg(baseline)!r} (saved {ago(time.time() - before.taken)} ago)"
         elif capture_a:
             before = self.capture_ref(capture_a).shot
             if capture_b:
                 after = self.capture_ref(capture_b).shot
             else:
                 if not before.target:
-                    raise ArgusError(f"{capture_a} can't be re-taken (snip, mark or file); pass capture_b too.")
+                    raise ArgusError(f"{display_arg(capture_a)} can't be re-taken (snip, mark or file); pass capture_b too.")
                 after = recapture(self.desk(), s, before.target)
-            name_before = f"{capture_a} ({ago(time.time() - before.taken)} ago)"
+            name_before = f"{display_arg(capture_a)} ({ago(time.time() - before.taken)} ago)"
         else:
             raise ArgusError('Pass baseline="name", or capture_a (and optionally capture_b).')
 
@@ -597,7 +601,8 @@ class Session:
             boxes = [m.box for m in outcome.matches[:5]]
         elif outcome.diff is not None and outcome.diff.regions:
             boxes = [r.ltrb_tuple() for r in outcome.diff.regions[:8]]
-        result = Result().text(("Done: " if outcome.ok else "Timed out: ") + f"{outcome.detail} after {outcome.elapsed:.1f}s.")
+        query = display_arg(text) if text and until in ("text", "text_gone") else ""
+        result = Result(query=query).text(("Done: " if outcome.ok else "Timed out: ") + f"{outcome.detail} after {outcome.elapsed:.1f}s.")
         if outcome.shot is not None:
             result.add(self.register(outcome.shot, grid=False, boxes=boxes))
         return result

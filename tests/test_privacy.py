@@ -321,6 +321,37 @@ def test_monitor_capture_in_work_profile_is_redacted(work_session):
     assert cap.image.getpixel((700, 200)) == privacy.SHADE and cap.image.getpixel((200, 200)) == WHITE
 
 
+def test_monitor_and_region_trust_only_visible_windows_in_capture(work_session):
+    editor = code(1, Rect(50, 50, 400, 300))
+    covered = win(3, "Covered", process="Code.exe", rect=Rect(200, 100, 40, 40), z=2)
+    same_monitor = win(4, "Other project", process="Code.exe", rect=Rect(550, 50, 350, 300), z=3)
+    other_monitor = win(5, "Other monitor", process="Code.exe", rect=Rect(-350, 50, 300, 300), z=4)
+    # The front window overlaps the region and hides the only bit of Other
+    # project that intersects it. That project is still visible on the monitor.
+    front = epic(0, Rect(550, 50, 100, 250))
+    monitors = [*MONS, mon(2, -1000, 0, 1000, 800)]
+    work_session.fake["desk"] = desk(monitors, [front, editor, covered, same_monitor, other_monitor])
+    monitor = work_session.screenshot(monitor="1").captures[0].shot
+    region = work_session.screenshot(region=[0, 0, 650, 250]).captures[0].shot
+    assert monitor.share_windows == privacy.named_windows([editor, same_monitor], W)
+    assert region.share_windows == privacy.named_windows([editor], W)
+
+
+def test_window_scope_has_target_and_overlap_but_excludes_other_matches(work_session, monkeypatch):
+    from argus import capture
+
+    target = code(1, Rect(100, 100, 400, 300))
+    overlap = win(4, "Overlap localhost", process="chrome.exe", rect=Rect(320, 100, 350, 300), z=0)
+    outside = win(5, "Other Visual Studio Code project", process="Code.exe", rect=Rect(700, 50, 250, 200), z=2)
+    work_session.fake["desk"] = desk(MONS, [overlap, target, outside])
+    monkeypatch.setattr(capture, "render_window", lambda w: Image.new("RGB", (w.rect.w, w.rect.h), WHITE))
+    shot = work_session.screenshot(window="Visual Studio Code").captures[0].shot
+    assert shot.method == "printwindow"
+    assert shot.share_windows == privacy.named_windows([target, overlap], W)
+    assert any("Other Visual Studio Code project" in note for note in shot.notes)
+    assert not shot.allow_trust
+
+
 def test_captures_from_the_personal_profile_are_not_reshown(work_session):
     from argus.capture import Shot
     from argus.imaging import render

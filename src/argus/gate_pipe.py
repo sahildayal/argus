@@ -15,7 +15,6 @@ import json
 import math
 import os
 import re
-import shutil
 import struct
 import sys
 import threading
@@ -90,7 +89,8 @@ def _session(pid: int) -> int:
 def _address() -> tuple[str, str]:
     sid = _sid(win.GetCurrentProcess())
     key = f"{sid}:{_session(os.getpid())}:{os.path.normcase(str(home().resolve()))}".encode()
-    return rf"\\.\pipe\ArgusApproval-v1-{hashlib.sha256(key).hexdigest()}", sid
+    # Version 2 requires a separate query field in the approval preview.
+    return rf"\\.\pipe\ArgusApproval-v2-{hashlib.sha256(key).hexdigest()}", sid
 
 
 def _new_pipe(address: str, sid: str, *, first: bool) -> int:
@@ -113,10 +113,7 @@ def _new_pipe(address: str, sid: str, *, first: bool) -> int:
 
 
 def _launchers(name: str) -> set[Path]:
-    found = shutil.which(name)
     candidates = [Path(sys.prefix) / "Scripts" / f"{name}.exe", Path(sys.executable).with_name(f"{name}.exe")]
-    if found:
-        candidates.append(Path(found))
     return {p.resolve() for p in candidates if p.is_file()}
 
 
@@ -281,12 +278,13 @@ def _parse(value: dict) -> Preview:
         )
     ):
         raise ValueError("Invalid approval window set")
-    if any(type(parts) is not list or any(type(p) is not str for p in parts) for parts in (images, text)):
+    if (type(value["query"]) is not str
+            or any(type(parts) is not list or any(type(p) is not str for p in parts) for parts in (images, text))):
         raise ValueError("Invalid approval preview")
     return Preview(
         rid, tool, tuple(base64.b64decode(b, validate=True) for b in images), tuple(text),
         None if windows is None else frozenset((h, exe, pid) for h, exe, pid in windows),
-        (tuple(stamp[0]), tuple(stamp[1])), deadline, value["allow_trust"], value["watching"],
+        (tuple(stamp[0]), tuple(stamp[1])), deadline, value["allow_trust"], value["watching"], value["query"],
     )
 
 

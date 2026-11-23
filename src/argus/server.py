@@ -11,6 +11,7 @@ import logging.handlers
 import sys
 from contextvars import ContextVar
 from typing import Annotated, Literal
+from uuid import uuid4
 
 import anyio
 from mcp.server import MCPServer
@@ -26,6 +27,7 @@ from .config import home, pretty_hotkey, settings
 from .desktop import ArgusError, Paused
 from .imaging import render
 from .service import Result, Session, caption
+from .text import display_arg
 
 log = logging.getLogger("argus")
 _session: Session | None = None
@@ -79,10 +81,14 @@ def _disclose(
     derived = tool in ("zoom", "read_text", "find_text") and bool(result.sources) and all(
         cap.shared_at == start.stamp for cap in result.sources
     )
+    can_trust = allow_trust and result.allow_trust and tool != "list_screens" and all(shot.allow_trust for shot in shots)
     gate.require(gate.request(
         tool, images, text, windows=windows, start=start, required=result.screen_derived,
-        previously_approved=derived, allow_trust=allow_trust and tool != "list_screens",
+        previously_approved=derived, query=result.query, allow_trust=can_trust,
     ))
+    if result.query:
+        request_text = f"{gate.QUERY_LABEL}: {result.query}"
+        out = [request_text, *out] if isinstance(out, list) else f"{request_text}\n\n{out}"
     if start.enabled and separator is None:
         for cap in caps:
             cap.shared_at = start.stamp
@@ -93,7 +99,7 @@ def _disclose(
 
 def _errors(fn):
     """Turn Argus errors into messages the AI can act on, and anything unexpected
-    into a short report (the traceback goes to ~/.argus/logs/server.log)."""
+    into a short report. Full tracebacks are logged only with approval off."""
 
     def explain(exc: Exception, start: gate.Policy | None):
         if isinstance(exc, ToolError):
@@ -102,9 +108,17 @@ def _errors(fn):
             if start is not None and not isinstance(exc, Paused):
                 gate.require(gate.request(fn.__name__, text=(str(exc),), start=start, allow_trust=False))
             return ToolError(str(exc))
-        log.exception("tool %s failed", fn.__name__)
-        if start is None or start.enabled:
-            return ToolError("Argus hit an unexpected error. Check the Argus server log.")
+        personal = False
+        if start is not None and not start.enabled:
+            try:
+                personal = not gate.policy().enabled
+            except (OSError, ValueError, gate.GateStopped):
+                pass
+        if not personal:
+            error_id = uuid4().hex
+            log.error("%s (error id %s)", type(exc).__name__, error_id)
+            return ToolError(f"Argus hit an unexpected error. Check the Argus server log for error id {error_id}.")
+        log.error("tool %s failed", fn.__name__, exc_info=exc)
         return ToolError(f"Argus hit an unexpected error ({type(exc).__name__}: {exc}). Details: {home() / 'logs' / 'server.log'}")
 
     def stopped(exc: gate.GateStopped) -> str:
@@ -329,6 +343,7 @@ async def wait_for(
     start = _policy.get()
     previous: Shot | None = None
     changed = False
+    query = display_arg(text) if text and until in ("text", "text_gone") else ""
 
     def review_segment(shot: Shot) -> None:
         nonlocal previous, changed
@@ -340,7 +355,7 @@ async def wait_for(
             view, _ = render(previous.image, max_side=settings().max_side)
             gate.require(gate.request(
                 "wait_for", (view.data,), windows=previous.share_windows, start=start,
-                watching=True, allow_trust=not changed,
+                watching=True, allow_trust=not changed and previous.allow_trust, query=query,
             ))
             changed = True
         previous = shot

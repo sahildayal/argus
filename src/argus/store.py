@@ -16,6 +16,7 @@ from pathlib import Path
 from PIL import Image, PngImagePlugin
 
 from .capture import Shot
+from .text import display_arg
 from .config import home
 from .desktop import ArgusError
 from .gate import Stamp
@@ -89,7 +90,7 @@ class Store:
             if key in self._items:
                 return self._items[key]
             recent = ", ".join(list(self._items)[-8:])
-        raise ArgusError(f"Unknown capture id {cid!r}. Recent captures: {recent}. (Older ones can be reopened by file path.)")
+        raise ArgusError(f"Unknown capture id {display_arg(cid)!r}. Recent captures: {recent}. (Older ones can be reopened by file path.)")
 
     def latest(self) -> Capture | None:
         with self._lock:
@@ -126,14 +127,14 @@ def open_file(path: str | Path) -> Shot:
     """Reopen a saved capture (or any image file) as a shot."""
     p = Path(path).expanduser()
     if not p.is_file():
-        raise ArgusError(f"No such file: {p}")
+        raise ArgusError(f"No such file: {display_arg(str(p))}")
     try:
         with Image.open(p) as im:
             im.load()
             info = dict(getattr(im, "text", {}) or {})
             img = im.convert("RGB")
     except OSError as exc:
-        raise ArgusError(f"Can't open {p.name} as an image ({exc})") from None
+        raise ArgusError(f"Can't open {display_arg(p.name)} as an image ({display_arg(str(exc))})") from None
     data: dict = {}
     if "argus" in info:
         try:
@@ -145,7 +146,7 @@ def open_file(path: str | Path) -> Shot:
     return Shot(
         image=img,
         kind="file",
-        label=data.get("label") or p.name,
+        label=data.get("label") or display_arg(p.name),
         origin=origin,  # type: ignore[arg-type]
         target=data.get("target") or {},
         method="file",

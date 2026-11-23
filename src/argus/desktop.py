@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw
 
 from . import win32
 from .geometry import Rect, bounding
+from .text import display_arg
 from .layout import arrange
 
 
@@ -448,7 +449,7 @@ def find_monitors(desk: Desktop, spec: str | int) -> list[Monitor]:
         mon = desk.monitor(int(m.group(1)))
         if mon:
             return [mon]
-        raise ArgusError(f"There is no monitor {m.group(1)}. {_monitor_options(desk)}")
+        raise ArgusError(f"There is no monitor {display_arg(m.group(1))}. {_monitor_options(desk)}")
     text = re.sub(r"^the\s+", "", text)
     text = re.sub(r"^(monitor|screen|display)\s+", "", text)
     text = re.sub(r"\s+(monitor|screen|display)$", "", text)
@@ -492,7 +493,7 @@ def find_monitors(desk: Desktop, spec: str | int) -> list[Monitor]:
             return partial
         if len(partial) > 1:
             names = ", ".join(f'"{m.position}" ({m.title})' for m in partial)
-            raise ArgusError(f'"{spec}" matches several monitors: {names}. Pick one.')
+            raise ArgusError(f'"{display_arg(str(spec))}" matches several monitors: {names}. Pick one.')
         if len(desk.monitors) == 1:
             return list(desk.monitors)
     device = [m for m in desk.monitors if m.device.lower().lstrip("\\.").endswith(text.lstrip("\\."))]
@@ -502,8 +503,8 @@ def find_monitors(desk: Desktop, spec: str | int) -> list[Monitor]:
     if len(named) == 1:
         return named
     if len(named) > 1:
-        raise ArgusError(f'"{spec}" matches several monitors. {_monitor_options(desk)}')
-    raise ArgusError(f'No monitor matches "{spec}". {_monitor_options(desk)}')
+        raise ArgusError(f'"{display_arg(str(spec))}" matches several monitors. {_monitor_options(desk)}')
+    raise ArgusError(f'No monitor matches "{display_arg(str(spec))}". {_monitor_options(desk)}')
 
 
 def _monitor_options(desk: Desktop) -> str:
@@ -538,7 +539,7 @@ def find_windows(
         w = desk.window(int(text, 0))
         if w:
             return [w]
-        raise ArgusError(f"No visible window has handle {text} (it may have closed). Call list_screens for current handles.")
+        raise ArgusError(f"No visible window has handle {display_arg(text)} (it may have closed). Call list_screens for current handles.")
 
     low = _APP_NICKNAMES.get(low, low)
     words = [t for t in re.split(r"\W+", low) if t]
@@ -567,7 +568,7 @@ def find_windows(
             scored.append((score, w))
     scored.sort(key=lambda sw: (-sw[0], sw[1].z))
     if not scored:
-        raise ArgusError(f'No window matches "{text}". Open windows: {_window_options(desk, name=name)}')
+        raise ArgusError(f'No window matches "{display_arg(text)}". Open windows: {_window_options(desk, name=name)}')
     return [w for _, w in scored]
 
 
