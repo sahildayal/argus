@@ -427,6 +427,8 @@ def cleanup(s: Settings, force: bool = False) -> int:
                 sub.rmdir()  # only succeeds when empty
             except OSError:
                 pass
+    from . import audit
+    removed += audit.cleanup_audit(s.audit_retention_months)
     return removed
 
 

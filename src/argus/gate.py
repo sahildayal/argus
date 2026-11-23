@@ -13,10 +13,11 @@ from .config import config_path, file_revision, settings
 from .privacy import WindowSet
 
 Stamp = tuple[tuple[int, int, int], tuple[int, int, int]]
-Reason = Literal["user", "trusted", "timeout", "tray_unavailable", "denied", "not_required"]
+Reason = Literal["user", "trusted", "timeout", "tray_unavailable", "denied", "not_required", "audit_failed"]
 DECLINED = "The user declined to share this capture."
 UNAVAILABLE = "Approval is unavailable. Ask the user to start or check the Argus tray (argus-tray), then try again."
 QUERY_LABEL = "Requested by the AI"
+AUDIT_FAILED = "The audit log could not be written."
 
 
 @dataclass(frozen=True)
@@ -71,7 +72,11 @@ class GateStopped(Exception):
 
 def require(decision: Decision) -> None:
     if not decision.approved:
-        raise GateStopped(UNAVAILABLE if decision.reason == "tray_unavailable" else DECLINED)
+        if decision.reason == "tray_unavailable":
+            raise GateStopped(UNAVAILABLE)
+        if decision.reason == "audit_failed":
+            raise GateStopped(AUDIT_FAILED)
+        raise GateStopped(DECLINED)
 
 
 def _transport(preview: Preview) -> str:
@@ -93,10 +98,12 @@ def request(
     watching: bool = False,
     query: str = "",
     transport: Callable[[Preview], str] | None = None,
+    client: str | None = None,
 ) -> Decision:
     """Decide whether MCP can disclose an output or use an earlier watch segment."""
     rid = uuid.uuid4().hex
     reason: Reason = "tray_unavailable"
+    current = None
     try:
         current = policy()
         start = start or current
@@ -121,7 +128,17 @@ def request(
     except (OSError, ValueError, GateStopped):
         pass  # Never include the transport error or preview content in an MCP reply.
     apps = sorted({exe for _, exe, _ in windows or () if exe})
-    return Decision(reason in ("user", "trusted", "not_required"), reason, tool, apps, time.time(), rid)
+    decision = Decision(reason in ("user", "trusted", "not_required"), reason, tool, apps, time.time(), rid)
+    s = settings()
+    gate_enabled = current.enabled if current is not None else False
+    if s.requires_audit and (gate_enabled or reason != "not_required" or s.audit_enabled):
+        from . import audit
+
+        try:
+            audit.log_decision(decision, shots=shots, text=text, profile=s.profile, client=client)
+        except Exception:
+            decision = Decision(False, "audit_failed", tool, apps, decision.when, rid)
+    return decision
 
 
 class Trust:

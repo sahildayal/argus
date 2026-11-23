@@ -234,6 +234,31 @@ deliberate choice:
   server's process and user before sending anything. Software already running
   as your Windows user can still tamper with the tray, its files or its input.
   Captures continue to use local storage and the configured retention period.
+- **Audit log of gate decisions:** In the work profile (and in personal when
+  opted in via `[audit] enabled = true`), every gate decision appends a JSON line
+  to `~/.argus/audit/audit-YYYY-MM.jsonl`.
+  - **What's logged:** timestamp (UTC ISO 8601), active profile (`work` or `personal`),
+    tool name, decision (`sent` or `denied`), reason (`user`, `trusted`, `timeout`,
+    `tray_unavailable`, `denied`, `not_required`, `audit_failed`), app executable names
+    only, image count, SHA-256 hashes of the exact image bytes sent (so an auditor can
+    later verify whether a specific image was or wasn't sent, without storing it),
+    length of returned text in characters, request ID, MCP client name (if reported by
+    the client session), Argus version, and a tamper-evidence hash chain (`prev` = SHA-256
+    of the previous line, chaining across monthly files).
+  - **What is NEVER logged:** window titles, OCR text, file paths of captures,
+    image pixels, or returned text content.
+  - **Fail closed:** if audit logging is enabled and the audit file cannot be written,
+    the gate decision fails closed (becomes `denied` with reason `audit_failed`), and
+    an MCP error is returned saying the audit log could not be written.
+  - **Tamper evidence:** `argus audit verify` checks the hash chain across files and reports
+    the first broken line. Note that this provides tamper evidence, not cryptographic
+    protection against local administrative users who could rewrite the history.
+  - **Retention & management:** monthly audit files are kept for 12 months by default
+    (`retention_months = 12` under `[audit]`) and cleaned up during the existing retention
+    pass. Audit logs are not deleted by `argus cleanup --all` or capture retention.
+    Inspect entries with `argus audit`, filter with `argus audit --since 2026-11-01`, verify
+    with `argus audit verify`, or export with `argus audit export --out compliance.jsonl`.
+    The tray also includes an "Open audit log folder" menu item.
 - **Blacked out before anything leaves Argus:** password managers, WhatsApp,
   Signal, Telegram, Messenger, Phone Link, Windows notification toasts, and
   browser tabs whose titles match banking/payments/messaging patterns. The AI
@@ -279,6 +304,10 @@ argus allow remove Code.exe
 argus allow add-title '^Jira'                  # match any window title
 argus allow add-title '\\blocalhost\\b' --browser # match browser tab titles
 argus allow remove-title '^Jira'
+argus audit                                   # show last 20 gate decisions
+argus audit --since 2026-11-01               # show decisions since date
+argus audit verify                            # check hash chain for tampering
+argus audit export --out compliance.jsonl    # export audit log
 ```
 
 `argus allow` edits the `[work]` lists in `~/.argus/config.toml`. Learning lists

@@ -138,6 +138,7 @@ class TrayApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Open captures folder", lambda: post(("open", home() / "captures"))),
             pystray.MenuItem("Open marks folder", lambda: post(("open", marks_dir()))),
+            pystray.MenuItem("Open audit log folder", lambda: post(("open", home() / "audit"))),
             pystray.MenuItem("Edit settings", lambda: post(("open", config_path()))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit Argus tray", lambda: post(("quit", None))),
@@ -204,6 +205,8 @@ class TrayApp:
             elif action == "revoke":
                 self.approvals.trust.revoke()
             elif action == "open":
+                if isinstance(arg, Path) and not arg.suffix:
+                    arg.mkdir(parents=True, exist_ok=True)
                 os.startfile(arg)  # noqa: S606 - opening our own folders/files
             elif action == "hotkeys" and arg:
                 self.pill("Argus couldn't register: " + "; ".join(arg), WARN, ms=4000)

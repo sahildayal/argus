@@ -33,6 +33,11 @@ active = "personal"
 timeout_seconds = 30
 trust_minutes = 10
 
+[audit]
+# Audit logging is on in work, off in personal. Uncomment to opt in for personal too.
+# enabled = true
+retention_months = 12
+
 [capture]
 # Longest side (px) of images sent to the AI. 2000 keeps long sessions with
 # many screenshots inside the API's multi-image limit, and lets a 1080p
@@ -143,6 +148,7 @@ _SCHEMA: dict[str, dict[str, object]] = {
     },
     "work": {"allow_apps": STRS, "allow_browser_titles": STRS, "allow_titles": STRS, "allow_snip_folder": bool},
     "gate": {"enabled": bool, "timeout_seconds": NUMBER, "trust_minutes": NUMBER},
+    "audit": {"enabled": bool, "retention_months": int},
 }
 # Sections whose mistakes can weaken the work profile: any problem in them locks
 # the work profile down to "nothing allowed" instead of half-applying the file.
@@ -191,6 +197,8 @@ class Settings:
     gate_enabled: bool = False  # personal opt-in; work always requires approval
     gate_timeout_seconds: float = 30.0
     gate_trust_minutes: float = 10.0
+    audit_enabled: bool = False  # personal opt-in; work always logs audit
+    audit_retention_months: int = 12
     problems: tuple[str, ...] = field(default=())
 
     @property
@@ -218,6 +226,10 @@ class Settings:
             "redact_notifications": self.redact_notifications,
         }
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:32]
+
+    @property
+    def requires_audit(self) -> bool:
+        return self.work or self.audit_enabled
 
     @classmethod
     def from_toml(cls, text: str) -> Settings:
@@ -254,6 +266,11 @@ class Settings:
                         bad(section, f"{section}.{key}: unknown setting (typo?)")
         gate = data.get("gate") if isinstance(data.get("gate"), dict) else {}
 
+        audit = data.get("audit", {})
+        if not isinstance(audit, dict):
+            problems.append("audit: expected a table; using the defaults")
+            audit = {}
+
         def get(section: str, key: str):
             sect = data.get(section)
             if not isinstance(sect, dict) or key not in sect:
@@ -280,6 +297,13 @@ class Settings:
                 return float(value)
             problems.append(f"gate.{key}: expected a positive number up to 86400; using the default")
             return float(defaults["gate"][key])
+
+        def audit_retention() -> int:
+            val = audit.get("retention_months", defaults.get("audit", {}).get("retention_months", 12))
+            if type(val) is int and val > 0:
+                return val
+            problems.append("audit.retention_months: expected a positive integer; using the default")
+            return 12
 
         sect = data.get("profile")
         raw = sect.get("active", "personal") if isinstance(sect, dict) else "personal"
@@ -309,6 +333,9 @@ class Settings:
             gate_enabled=gate.get("enabled") is True,
             gate_timeout_seconds=gate_duration("timeout_seconds"),
             gate_trust_minutes=gate_duration("trust_minutes"),
+            # Personal opt-in only: the work profile always audits (Settings.requires_audit).
+            audit_enabled=audit.get("enabled") is True,
+            audit_retention_months=audit_retention(),
         )
         # Fail closed: an unreadable file or a broken [profile] means work; a
         # mistake anywhere that shapes the work profile means nothing is allowed
