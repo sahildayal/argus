@@ -24,27 +24,29 @@ from .config import home
 
 _VERSION = b"argus-seal-v1\n"
 _lock = threading.Lock()
-_keys: dict[Path, bytes] = {}
 
 
 def _key_path() -> Path:
     return home() / "seal.key"
 
 
-def key() -> bytes:
+def key(create: bool = True) -> bytes:
+    """The sealing key, read from disk on every call - never cached - so a key
+    file that was deleted, replaced or made unreadable takes effect at once.
+    With *create* False (verifying), a missing key is an error rather than a
+    reason to make a new one."""
     path = _key_path()
     with _lock:
-        if path in _keys:
-            return _keys[path]
         for _ in range(20):
             try:
                 data = path.read_bytes()
             except FileNotFoundError:
+                if not create:
+                    raise OSError("seal.key is missing") from None
                 data = b""
             if len(data) == 32:
-                _keys[path] = data
                 return data
-            if not data:
+            if not data and create:
                 _create(path)
                 continue
             # Another process is mid-write (or the file is damaged): wait a bit.
@@ -75,16 +77,22 @@ def _pixels(image: Image.Image) -> bytes:
     return h.digest()
 
 
-def sign(meta_json: str, image: Image.Image) -> str:
+def _mac(secret: bytes, meta_json: str, image: Image.Image) -> str:
     msg = _VERSION + meta_json.encode("utf-8") + b"\n" + _pixels(image)
-    return hmac.new(key(), msg, hashlib.sha256).hexdigest()
+    return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+
+
+def sign(meta_json: str, image: Image.Image) -> str:
+    return _mac(key(), meta_json, image)
 
 
 def verify(meta_json: str, image: Image.Image, seal: str) -> bool:
+    """Does *seal* authenticate this metadata and these pixels? False whenever
+    the key file is missing, unreadable or damaged - it is re-read every time."""
     if not seal:
         return False
     try:
-        expected = sign(meta_json, image)
+        secret = key(create=False)
     except OSError:
         return False
-    return hmac.compare_digest(expected, seal)
+    return hmac.compare_digest(_mac(secret, meta_json, image), seal)

@@ -353,7 +353,6 @@ def _shot(profile="work", policy=None, colour="white"):
 def test_seal_key_is_created_once_and_reused(argus_home):
     k = seal.key()
     assert len(k) == 32 and (argus_home / "seal.key").read_bytes() == k
-    seal._keys.clear()
     assert seal.key() == k
 
 

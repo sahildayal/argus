@@ -81,14 +81,20 @@ def latest(
     clip_seq: int | None = None,
     folder: Path | None = None,
     include_files: bool = True,
+    clipboard_files: bool | None = None,
 ) -> list[Snip]:
     """Newest snips first. The clipboard image counts as a snip unless it's the
-    same picture as the newest saved one (a Win+Shift+S snip lands in both)."""
+    same picture as the newest saved one (a Win+Shift+S snip lands in both).
+
+    *include_files*: read the Screenshots folder. *clipboard_files*: open image
+    files copied in Explorer (a clipboard file list); defaults to
+    *include_files* for callers that don't separate the two."""
     count = max(1, min(count, 10))
     files = recent_files(count, folder) if include_files else []
     entries: list[tuple[float, Snip | tuple[Path, float]]] = [(mtime, (path, mtime)) for path, mtime in files]
 
-    clip = clipboard_image() if include_files else clipboard_image(files=False)
+    clip_files = include_files if clipboard_files is None else clipboard_files
+    clip = clipboard_image() if clip_files else clipboard_image(files=False)
     if clip is not None:
         newest = _open(files[0][0]) if files else None
         if newest is None or not same_image(clip, newest):

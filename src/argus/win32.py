@@ -198,6 +198,7 @@ WS_CHILD = 0x40000000
 
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
+LWA_COLORKEY = 0x1
 LWA_ALPHA = 0x2
 PW_RENDERFULLCONTENT = 0x2
 MONITOR_DEFAULTTONEAREST = 2
@@ -403,10 +404,19 @@ def dpi_ok() -> bool:
 
 def layered_alpha(hwnd: int) -> int | None:
     """Constant alpha of a layered window, or None if it doesn't use one."""
+    return layered_attributes(hwnd)[0]
+
+
+def layered_attributes(hwnd: int) -> tuple[int | None, bool]:
+    """(constant alpha or None, uses a colour key) of a layered window.
+
+    GetLayeredWindowAttributes fails for windows drawn with UpdateLayeredWindow
+    (per-pixel alpha): those come back as (None, False), i.e. no evidence of
+    opacity at all."""
     alpha, flags = wintypes.BYTE(), wintypes.DWORD()
-    if GetLayeredWindowAttributes(hwnd, None, ctypes.byref(alpha), ctypes.byref(flags)) and flags.value & LWA_ALPHA:
-        return alpha.value & 0xFF
-    return None
+    if not GetLayeredWindowAttributes(hwnd, None, ctypes.byref(alpha), ctypes.byref(flags)):
+        return None, False
+    return (alpha.value & 0xFF if flags.value & LWA_ALPHA else None), bool(flags.value & LWA_COLORKEY)
 
 
 def cursor_pos() -> tuple[int, int]:

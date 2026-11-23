@@ -338,11 +338,11 @@ def test_latest_snip_skips_the_screenshots_folder_in_work_profile(work_session, 
 
     seen = {}
 
-    def fake_latest(count, clip_time, clip_seq, include_files=True):
-        seen["include_files"] = include_files
+    def fake_latest(count, clip_time, clip_seq, include_files=True, clipboard_files=None):
+        seen["include_files"], seen["clipboard_files"] = include_files, clipboard_files
         return []
 
     monkeypatch.setattr(service, "latest_snips", fake_latest)
     with pytest.raises(ArgusError, match="clipboard"):
         work_session.latest_snip()
-    assert seen["include_files"] is False
+    assert seen["include_files"] is False and seen["clipboard_files"] is False

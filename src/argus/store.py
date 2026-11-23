@@ -19,6 +19,7 @@ from . import seal
 from .capture import Shot
 from .config import Settings, home
 from .desktop import ArgusError
+from .errors import work_profile
 from .gate import Stamp
 from .imaging import View
 
@@ -135,14 +136,19 @@ def meta(shot: Shot) -> dict:
 def open_file(path: str | Path) -> Shot:
     """Reopen a saved capture (or any image file) as a shot."""
     p = Path(path).expanduser()
+    # Work profile: file names never go into error text (capture names are built
+    # from window labels, and a user's own files can be named after anything).
+    work = work_profile()
     if not p.is_file():
-        raise ArgusError(f"No such file: {p}")
+        raise ArgusError("No such file (name withheld by the work profile)." if work else f"No such file: {p}")
     try:
         with Image.open(p) as im:
             im.load()
             info = dict(getattr(im, "text", {}) or {})
             img = im.convert("RGB")
     except OSError as exc:
+        if work:
+            raise ArgusError(f"That file can't be opened as an image ({type(exc).__name__}).") from None
         raise ArgusError(f"Can't open {p.name} as an image ({exc})") from None
     data: dict = {}
     if "argus" in info:
@@ -170,6 +176,7 @@ def open_file(path: str | Path) -> Shot:
         source=p,
         profile=str(data.get("profile") or ""),
         policy=str(data.get("policy") or "") if authentic else "",
+        sealed=authentic,
     )
 
 

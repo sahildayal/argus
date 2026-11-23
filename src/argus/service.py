@@ -18,7 +18,7 @@ from .focus import Tracker
 from .geometry import Rect
 from .imaging import render, side_by_side
 from .looking import ago, choose, host_label
-from .marks import recent_marks
+from .marks import Mark, recent_marks
 from .snips import latest as latest_snips, screenshots_dir
 from .store import Capture, Store, open_file, replayable
 
@@ -90,6 +90,16 @@ def _require_profile(shot: Shot, s: Settings) -> None:
             "personal profile, from before the allowed apps changed, or isn't a capture Argus can vouch for), so Argus "
             "won't show it. Take a fresh capture instead."
         )
+
+
+def _mark_caption(mark: Mark, shot: Shot | None) -> tuple[str, float]:
+    """(what the mark shows, when it was made), from the sealed PNG metadata -
+    never from the mark's JSON sidecar, which isn't signed and could say
+    anything. An unsealed mark gets a generic caption (the work profile refuses
+    it anyway: without a seal it has no policy stamp)."""
+    if shot is not None and shot.sealed:
+        return shot.label, shot.taken
+    return "the marked area (its label couldn't be verified)", mark.when
 
 
 def _same_policy(s: Settings) -> None:
@@ -175,12 +185,12 @@ class Session:
             mark = marks[0] if marks else None
             if mark and mark.id not in self.used_marks and time.time() - mark.when <= s.mark_freshness:
                 shot = mark.shot(scope)
-                if shot is not None and _profile_ok(shot, s):
+                what, when = _mark_caption(mark, shot)
+                if shot is not None and _profile_ok(shot, s) and time.time() - when <= s.mark_freshness:
                     if not self.defer_marks:
                         self.used_marks.add(mark.id)
-                    what = mark.info.get("monitor" if scope == "monitor" else "window") or mark.info.get("monitor")
                     result = Result(mark_id=mark.id).text(
-                        f"Using the hotkey mark you made {ago(time.time() - mark.when)} ago: {what}. "
+                        f"Using the hotkey mark you made {ago(time.time() - when)} ago: {what}. "
                         "(look(fresh=true) captures live instead.)"
                     )
                     return self._show(result, [shot], grid)
@@ -372,28 +382,43 @@ class Session:
 
     def latest_snip(self, count: int = 1, grid: bool | None = None) -> Result:
         s = self.guard()
+        if s.lockdown:
+            raise ArgusError(
+                "Argus's settings file has a problem, so the work profile is locked down and won't share snips at all. "
+                "Tell the user; `argus status` shows what to fix."
+            )
         tr = self.tracker
         # Snips can't be redacted (Argus doesn't know what windows they show), so
-        # the work profile skips the Screenshots folder unless the user opted in.
+        # the work profile skips the Screenshots folder and copied files unless
+        # the user opted in to each separately.
         files = not s.work or s.allow_snip_folder
-        snips = latest_snips(count, tr.clip_time if tr else None, tr.clip_seq if tr else None, include_files=files)
+        clip_files = not s.work or s.allow_clipboard_files
+        snips = latest_snips(count, tr.clip_time if tr else None, tr.clip_seq if tr else None, include_files=files,
+                             clipboard_files=clip_files)
         if not snips:
             if not files:
                 raise ArgusError(
                     "No snip on the clipboard. The work profile doesn't read the Screenshots folder, so the user has to "
                     "copy the snip (Win+Shift+S puts it on the clipboard)."
                 )
+            folder = "the Screenshots folder" if s.work else str(screenshots_dir())
             raise ArgusError(
-                f"No snips found: the clipboard holds no image and {screenshots_dir()} has no screenshots. "
+                f"No snips found: the clipboard holds no image and {folder} has no screenshots. "
                 "The user can snip with Win+Shift+S."
             )
         shots = []
         for sn in snips:
             when = f"{ago(time.time() - sn.when)} ago" if sn.when else "before Argus started watching the clipboard"
-            what = f"saved snip {sn.path.name}" if sn.path else "image on the clipboard"
+            if sn.path:
+                what = "saved snip" if s.work else f"saved snip {sn.path.name}"
+            else:
+                what = "image on the clipboard"
+            # A snip is an image of unknown origin: it's never stamped with a
+            # policy (nor sealed as one when saved), so it can't later be replayed
+            # from disk as a verified work capture. The gate still previews it.
             shots.append(
                 Shot(image=sn.image, kind="snip", label=f"{what}, from {when}", origin=None, target={}, method=sn.source,
-                     taken=sn.when or time.time(), source=sn.path, profile=s.profile, policy=s.policy)
+                     taken=sn.when or time.time(), source=sn.path, profile="", policy="")
             )
         result = Result()
         if len(shots) > 1:
@@ -420,8 +445,8 @@ class Session:
             )
         if not self.defer_marks:
             self.used_marks.add(mark.id)
-        what = mark.info.get("monitor" if scope == "monitor" else "window") or mark.info.get("monitor")
-        result = Result(mark_id=mark.id).text(f"Hotkey mark from {ago(time.time() - mark.when)} ago: {what}.")
+        what, when = _mark_caption(mark, shot)
+        result = Result(mark_id=mark.id).text(f"Hotkey mark from {ago(time.time() - when)} ago: {what}.")
         return self._show(result, [shot], grid)
 
     # -- OCR ---------------------------------------------------------------------------
@@ -523,7 +548,8 @@ class Session:
                 after = self.capture_ref(capture_b).shot
             else:
                 if not before.target:
-                    raise ArgusError(f"{capture_a} can't be re-taken (snip, mark or file); pass capture_b too.")
+                    which = "That capture" if s.work else capture_a  # it may be a file path
+                    raise ArgusError(f"{which} can't be re-taken (snip, mark or file); pass capture_b too.")
                 after = recapture(self.desk(), s, before.target)
             name_before = f"{capture_a} ({ago(time.time() - before.taken)} ago)"
         else:
@@ -634,6 +660,8 @@ def status_text() -> str:
         [
             f"Argus {__version__}: {state.describe()}",
             f"Profile: {s.profile}" + (" (only allowed apps are visible)" if s.work else " (everything but the privacy list is visible)"),
+            *([f"Why work: {s.profile_reason}" + (" - and nothing is allowed until config.toml is fixed" if s.lockdown else "") + "."]
+              if s.work and s.profile_reason else []),
             f"Data: {home()}",
             f"Settings: {config_path()}",
             f"Hotkeys: mark {pretty_hotkey(s.hotkey_mark)}, pause {pretty_hotkey(s.hotkey_pause)} (tray app)",

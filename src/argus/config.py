@@ -110,7 +110,15 @@ allow_titles = []
 # Let latest_snip read saved snips from Pictures\\Screenshots. Off by default:
 # a snip is an image of unknown origin, so Argus can't black anything out in it.
 allow_snip_folder = false
+# Let latest_snip open image files copied in Explorer (a clipboard file list).
+# Off by default: a copied file can be any image on disk. Separate from
+# allow_snip_folder on purpose.
+allow_clipboard_files = false
 """
+
+# Bump whenever privacy.py's masking changes (what gets revealed or hidden), so
+# captures sealed under the old masker stop replaying in the work profile.
+REDACTION_VERSION = 2
 
 
 def home() -> Path:
@@ -122,6 +130,32 @@ def home() -> Path:
 
 def config_path() -> Path:
     return home() / "config.toml"
+
+
+def profile_state_path() -> Path:
+    """Remembers that the work profile was switched on (``work``) or explicitly
+    off (``personal``), so losing or mangling config.toml can't drop work."""
+    return home() / "profile.state"
+
+
+def read_profile_state() -> str | None:
+    """"work", "personal", or None when there's no marker (first run). A marker
+    that exists but can't be read or says anything else counts as work."""
+    path = profile_state_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError):
+        return "work"
+    return "personal" if text.strip().lower() == "personal" else "work"
+
+
+def write_profile_state(name: str) -> None:
+    path = profile_state_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(name + "\n", encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def tray_mutex_name() -> str:
@@ -141,12 +175,36 @@ _SCHEMA: dict[str, dict[str, object]] = {
         "retention_days": NUMBER, "redact_notifications": bool, "redact_apps": STRS,
         "redact_browser_titles": STRS, "redact_titles": STRS, "browsers": STRS,
     },
-    "work": {"allow_apps": STRS, "allow_browser_titles": STRS, "allow_titles": STRS, "allow_snip_folder": bool},
+    "work": {
+        "allow_apps": STRS, "allow_browser_titles": STRS, "allow_titles": STRS, "allow_snip_folder": bool,
+        "allow_clipboard_files": bool,
+    },
     "gate": {"enabled": bool, "timeout_seconds": NUMBER, "trust_minutes": NUMBER},
 }
 # Sections whose mistakes can weaken the work profile: any problem in them locks
 # the work profile down to "nothing allowed" instead of half-applying the file.
 _CRITICAL = {"profile", "privacy", "work"}
+# An unknown section this close (edit distance) to one of these is taken for a
+# misspelling of it - e.g. [profiles] or [privcy] - and counts as a critical problem.
+_TYPO_TARGETS = ("profile", "privacy", "work", "gate")
+_TYPO_DISTANCE = 2
+
+
+def _distance(a: str, b: str) -> int:
+    """Levenshtein edit distance."""
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _typo_of(section: str) -> str | None:
+    name = section.strip().lower()
+    hits = [(d, t) for t in _TYPO_TARGETS if (d := _distance(name, t)) <= _TYPO_DISTANCE]
+    return min(hits)[1] if hits else None
 
 
 def _type_ok(value: object, kind: object) -> bool:
@@ -188,10 +246,14 @@ class Settings:
     allow_browser_titles: tuple[re.Pattern, ...] = ()
     allow_titles: tuple[re.Pattern, ...] = ()
     allow_snip_folder: bool = False
+    allow_clipboard_files: bool = False
     gate_enabled: bool = False  # personal opt-in; work always requires approval
     gate_timeout_seconds: float = 30.0
     gate_trust_minutes: float = 10.0
     problems: tuple[str, ...] = field(default=())
+    configured: str = ""  # what a valid [profile] active says ("" = missing or unusable)
+    profile_reason: str = ""  # why the work profile is on, for status / tray
+    lockdown: bool = False  # the fail-closed fallback: work with nothing allowed
 
     @property
     def work(self) -> bool:
@@ -206,11 +268,13 @@ class Settings:
         allow lists, block lists). Captures are stamped with it; in the work
         profile an image is only shown again under the same policy."""
         data = {
+            "redaction_version": REDACTION_VERSION,
             "profile": self.profile,
             "allow_apps": sorted(self.allow_apps),
             "allow_browser_titles": [p.pattern for p in self.allow_browser_titles],
             "allow_titles": [p.pattern for p in self.allow_titles],
             "allow_snip_folder": self.allow_snip_folder,
+            "allow_clipboard_files": self.allow_clipboard_files,
             "redact_apps": sorted(self.redact_apps),
             "redact_browser_titles": [p.pattern for p in self.redact_browser_titles],
             "redact_titles": [p.pattern for p in self.redact_titles],
@@ -220,31 +284,40 @@ class Settings:
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:32]
 
     @classmethod
-    def from_toml(cls, text: str) -> Settings:
+    def from_toml(cls, text: str, sticky_work: bool = False) -> Settings:
+        """Settings from config.toml's text. *sticky_work*: the work profile was
+        switched on (``profile.state`` says work), so the result is work whatever
+        the file says, until it's switched off with `argus profile personal`."""
         try:
             data = tomllib.loads(text)
         except tomllib.TOMLDecodeError as exc:
-            return cls.locked(f"config.toml is not valid TOML ({exc})")
-        return cls._from_data(data, [], broken=False)
+            return cls.locked(f"config.toml is not valid TOML ({exc})", sticky_work)
+        return cls._from_data(data, [], broken=False, sticky=sticky_work)
 
     @classmethod
-    def locked(cls, why: str) -> Settings:
+    def locked(cls, why: str, sticky_work: bool = False) -> Settings:
         """Settings for a config file Argus can't read: the work profile with
         nothing allowed. Failing closed matters more than a personal-profile user
         seeing black captures until they fix the file (the problem says why)."""
-        return cls._from_data({}, [f"{why}. Until it's fixed, Argus uses the work profile with nothing allowed."], broken=True)
+        problem = f"{why}. Until it's fixed, Argus uses the work profile with nothing allowed."
+        return cls._from_data({}, [problem], broken=True, sticky=sticky_work)
 
     @classmethod
-    def _from_data(cls, data: dict, problems: list[str], broken: bool) -> Settings:
+    def _from_data(cls, data: dict, problems: list[str], broken: bool, sticky: bool = False) -> Settings:
         defaults = tomllib.loads(DEFAULT_CONFIG)
         critical: set[str] = set()  # sections with a problem
+        typo = False  # a misspelt critical section (any of them locks the work profile)
 
         def bad(section: str, message: str) -> None:
             problems.append(message)
             critical.add(section)
 
         for section, value in data.items():
-            if section not in _SCHEMA:
+            if section not in _SCHEMA and (near := _typo_of(section)):
+                bad(near, f"[{section}]: unknown section that looks like a misspelt [{near}]; its settings are ignored, "
+                          "so it counts as a problem in that section")
+                typo = True
+            elif section not in _SCHEMA:
                 problems.append(f"[{section}]: unknown section (ignored)")
             elif not isinstance(value, dict):
                 bad(section, f"{section}: should be a [{section}] section, not a single value")
@@ -287,6 +360,8 @@ class Settings:
         if isinstance(raw, str) and profile not in PROFILES:
             bad("profile", 'profile.active: unknown profile (use "personal" or "work"); using "work" with nothing allowed to be safe')
         get("profile", "active")  # reports a non-string value
+        has_active = isinstance(sect, dict) and "active" in sect
+        configured = profile if has_active and profile in PROFILES and "profile" not in critical else ""
 
         values = dict(
             max_side=max(256, int(get("capture", "max_side"))),
@@ -306,6 +381,7 @@ class Settings:
             allow_browser_titles=patterns("work", "allow_browser_titles"),
             allow_titles=patterns("work", "allow_titles"),
             allow_snip_folder=bool(get("work", "allow_snip_folder")),
+            allow_clipboard_files=bool(get("work", "allow_clipboard_files")),
             gate_enabled=gate.get("enabled") is True,
             gate_timeout_seconds=gate_duration("timeout_seconds"),
             gate_trust_minutes=gate_duration("trust_minutes"),
@@ -313,21 +389,42 @@ class Settings:
         # Fail closed: an unreadable file or a broken [profile] means work; a
         # mistake anywhere that shapes the work profile means nothing is allowed
         # (a half-applied file could leave an allow rule active without the
-        # block rule meant to go with it).
+        # block rule meant to go with it). Once switched on, work stays on
+        # whatever the file says (an empty, recreated or hand-edited file
+        # included) until it's switched off with `argus profile personal`.
+        reason = ""
+        if sticky and profile != "work":
+            what = {"personal": 'says active = "personal"'}.get(configured, "doesn't set [profile] active")
+            if broken:
+                what = "can't be used"
+            reason = (
+                f"the work profile was switched on (tray or `argus profile work`) and stays on until it's switched off "
+                f"the same way; config.toml {what}, which alone can't turn it off"
+            )
+            profile = "work"
+        elif broken:
+            reason = "config.toml can't be used, so Argus fails closed to the work profile"
+        elif "profile" in critical:
+            reason = "config.toml's [profile] section has a problem, so Argus fails closed to the work profile"
         if broken or "profile" in critical:
             profile = "work"
-        if profile == "work" and (broken or critical & _CRITICAL):
+        if not reason and profile == "work":
+            reason = 'config.toml sets [profile] active = "work"'
+        lockdown = profile == "work" and bool(broken or critical & _CRITICAL or typo)
+        if lockdown:
             if not broken:
                 problems.append("Because of the problem(s) above, the work profile allows nothing until config.toml is fixed.")
-            values.update(allow_apps=frozenset(), allow_browser_titles=(), allow_titles=(), allow_snip_folder=False)
-        return cls(profile=profile, problems=tuple(problems), **values)
+            values.update(allow_apps=frozenset(), allow_browser_titles=(), allow_titles=(), allow_snip_folder=False,
+                          allow_clipboard_files=False)
+        return cls(profile=profile, problems=tuple(problems), configured=configured, profile_reason=reason,
+                   lockdown=lockdown, **values)
 
 
 PROFILES = ("personal", "work")
 
 
 _lock = threading.Lock()
-_cache: tuple[tuple[Path, int, int, int], Settings] | None = None
+_cache: tuple[tuple, Settings] | None = None
 
 
 def file_revision(path: Path) -> tuple[int, int, int]:
@@ -342,15 +439,26 @@ def settings() -> Settings:
     """Current settings; writes the commented default file on first use."""
     global _cache
     path = config_path()
+    marker = profile_state_path()
     with _lock:
         if not path.exists():
             path.write_text(DEFAULT_CONFIG, encoding="utf-8")
-        revision = (path, *file_revision(path))
+        revision = (path, *file_revision(path), *file_revision(marker))
         if _cache is None or _cache[0] != revision:
+            state = read_profile_state()
+            sticky = state == "work"
             try:
-                parsed = Settings.from_toml(path.read_text(encoding="utf-8"))
+                parsed = Settings.from_toml(path.read_text(encoding="utf-8"), sticky_work=sticky)
             except (OSError, UnicodeDecodeError) as exc:
-                parsed = Settings.locked(f"config.toml can't be read ({type(exc).__name__})")
+                parsed = Settings.locked(f"config.toml can't be read ({type(exc).__name__})", sticky)
+            if parsed.configured == "work" and not sticky:
+                # Work chosen by editing the file sticks too: a later edit that
+                # drops or mangles [profile] mustn't quietly turn it off.
+                try:
+                    write_profile_state("work")
+                except OSError:
+                    pass
+                revision = (path, *file_revision(path), *file_revision(marker))
             _cache = (revision, parsed)
         return _cache[1]
 
@@ -359,12 +467,30 @@ def set_profile(name: str) -> Settings:
     """Switch ``[profile] active`` in config.toml, editing just that line so the
     user's comments and layout survive. Returns the new settings. The edit is
     verified by parsing the file before and after: only profile.active may
-    change, or the file is left alone."""
+    change, or the file is left alone.
+
+    The choice is also recorded in ``profile.state``. Switching to work records
+    it first, so work takes effect (and sticks) even if config.toml can't be
+    edited; switching to personal records it only once the file says personal."""
     global _cache
     name = name.strip().lower()
     if name not in PROFILES:
         raise ValueError(f"unknown profile {name!r}; use one of: {', '.join(PROFILES)}")
+    if name == "work":
+        with _lock:
+            write_profile_state("work")
+            _cache = None
     settings()  # writes the default file if there is none
+    _set_profile_line(name)
+    if name == "personal":
+        with _lock:
+            write_profile_state("personal")
+            _cache = None
+    return settings()
+
+
+def _set_profile_line(name: str) -> None:
+    global _cache
     path = config_path()
     with _lock:
         with open(path, encoding="utf-8", newline="") as f:  # keep the file's line endings
@@ -390,7 +516,6 @@ def set_profile(name: str) -> Settings:
         tmp.write_text(new, encoding="utf-8", newline="")
         os.replace(tmp, path)
         _cache = None
-    return settings()
 
 
 WORK_LIST_KEYS = {"allow_apps", "allow_browser_titles", "allow_titles"}
