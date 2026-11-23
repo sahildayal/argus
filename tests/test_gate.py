@@ -117,3 +117,11 @@ def test_trust_and_in_flight_approval_are_invalid_after_state_change(change):
         return "user"
 
     assert gate.request("look", windows=WINDOWS, start=current, transport=transport).reason == "denied"
+
+
+def test_display_arg_drops_invisible_fillers_and_mark_floods():
+    from argus.text import display_arg
+    fillers = "\u3164" * 50 + "\u2800\u115f\u180b\ue000"
+    assert display_arg(fillers + "ok") == "ok"
+    flood = display_arg("a" + "\u0301" * 150)
+    assert flood.startswith("\u00e1") and len(flood) <= 3

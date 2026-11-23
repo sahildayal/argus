@@ -171,7 +171,7 @@ def capture_monitor(desk: Desktop, mon: Monitor, s: Settings) -> Shot:
         cursor=desk.cursor,
         monitor=mon,
         profile=s.profile,
-        share_windows=share_scope(desk, s, mon.rect) if s.requires_approval else None,
+        share_windows=share_scope(desk, s, area) if s.requires_approval else None,  # the grabbed area
         policy=s.policy,
     )
 

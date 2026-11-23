@@ -163,7 +163,7 @@ def test_preview_shows_grid_text_summary_and_trust_scope(approval_ui):
     assert summary in [w.cget("text") for w in widgets if w.winfo_class() == "TLabel" and w.winfo_ismapped()]
     assert any(w.winfo_class() == "TLabelframe" and w.cget("text") == gate.QUERY_LABEL for w in widgets)
     text = [w.get("1.0", "end-1c") for w in widgets if w.winfo_class() == "Text" and w.winfo_ismapped()]
-    assert "Screen caption" in text and "Trust for 10 min: Code.exe — Allowed title, unknown.exe" in text
+    assert "Screen caption" in text and "Trust 2 windows for 10 min:\nCode.exe — Allowed title\nunknown.exe" in text
     assert window.winfo_width() == 700 and window.winfo_height() == 560
 
     canvas = next(w for w in widgets if w.winfo_class() == "Canvas")

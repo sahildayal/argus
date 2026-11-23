@@ -172,7 +172,8 @@ class Approvals:
             labels = _trust_labels(preview.windows)
             scope = ttk.Frame(buttons)
             scope.pack(side="left", fill="both", expand=True)
-            _text_panel(scope, f"Trust for {minutes:g} min: {', '.join(labels)}", height=2, width=1)
+            heading = f"Trust {len(labels)} window{'s' if len(labels) != 1 else ''} for {minutes:g} min:"
+            _text_panel(scope, heading + "\n" + "\n".join(labels), height=min(len(labels) + 1, 8), width=1)
         for button in [deny, *approvals]:
             button.bind("<Return>", lambda _event: "break")
             button.bind("<KP_Enter>", lambda _event: "break")

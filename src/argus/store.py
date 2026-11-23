@@ -167,7 +167,7 @@ def open_file(path: str | Path) -> Shot:
     return Shot(
         image=img,
         kind="file",
-        label=data.get("label") or display_arg(p.name),
+        label=display_arg(data.get("label") or p.name),
         origin=origin,  # type: ignore[arg-type]
         target=data.get("target") or {},
         method="file",
