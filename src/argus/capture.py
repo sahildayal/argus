@@ -14,7 +14,7 @@ from . import win32
 from .config import Settings
 from .desktop import ArgusError, Desktop, Monitor, Window, find_monitors, find_windows
 from .geometry import Rect
-from .privacy import check_window, display_name, redact, sensitive_reason, shown
+from .privacy import WindowSet, check_window, display_name, redact, sensitive_reason, share_scope, shown
 
 
 @dataclass
@@ -33,6 +33,7 @@ class Shot:
     taken: float = field(default_factory=time.time)
     source: Path | None = None  # the file a snip/mark came from
     profile: str = ""  # privacy profile it was taken under ("" = unknown, e.g. any image file)
+    share_windows: WindowSet | None = None  # live provenance, never loaded from a PNG
 
     @property
     def cursor_in_image(self) -> tuple[int, int] | None:
@@ -70,6 +71,7 @@ def capture_monitor(desk: Desktop, mon: Monitor, s: Settings) -> Shot:
         cursor=desk.cursor,
         monitor=mon,
         profile=s.profile,
+        share_windows=share_scope(desk, s) if s.requires_approval else None,
     )
 
 
@@ -94,6 +96,7 @@ def capture_region(desk: Desktop, rect: Rect, s: Settings, label: str | None = N
         cursor=desk.cursor,
         monitor=mon,
         profile=s.profile,
+        share_windows=share_scope(desk, s) if s.requires_approval else None,
     )
 
 
@@ -142,6 +145,7 @@ def capture_window(desk: Desktop, win: Window, s: Settings) -> Shot:
         monitor=mon,
         window=win,
         profile=s.profile,
+        share_windows=share_scope(desk, s, [win]) if s.requires_approval else None,
     )
     visible = desk.visible_fraction(win)
     if visible >= 0.995:
@@ -212,6 +216,8 @@ def capture(desk: Desktop, s: Settings, monitor=None, window=None, region=None) 
         others = [w for w in matches[1:4] if w.hwnd != win.hwnd]
         if others:
             shot.notes.append("Also matched: " + "; ".join(f"{name(w)} [{w.handle}]" for w in others) + ".")
+        if shot.share_windows is not None:
+            shot.share_windows |= share_scope(desk, s, [win, *others])
         return [shot]
 
     if monitor is not None:

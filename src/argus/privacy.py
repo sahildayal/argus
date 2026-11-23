@@ -7,6 +7,7 @@ import json
 import shutil
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from PIL import Image, ImageDraw
@@ -37,6 +38,11 @@ def _pause_file():
     return home() / "paused.json"
 
 
+def pause_revision_file():
+    """A persistent marker so the tray sees even a quick pause/resume."""
+    return home() / "gate-pause"
+
+
 def pause_state() -> PauseState:
     path = _pause_file()
     if not path.exists():
@@ -56,10 +62,13 @@ def pause(minutes: float | None = None) -> PauseState:
     now = time.time()
     until = now + minutes * 60 if minutes else None
     _pause_file().write_text(json.dumps({"since": now, "until": until}), encoding="utf-8")
+    pause_revision_file().touch()
     return PauseState(True, now, until)
 
 
 def resume() -> None:
+    if _pause_file().exists():
+        pause_revision_file().touch()
     _pause_file().unlink(missing_ok=True)
 
 
@@ -142,6 +151,20 @@ def check_window(w: Window, s: Settings) -> None:
 
 WORK_HIDDEN = "everything outside the allowed apps (work profile)"
 WORK_LABEL = "Hidden by Argus: work profile"
+WindowSet = frozenset[tuple[int, str, int]]  # HWND, executable name, PID
+
+
+def share_scope(desk: Desktop, s: Settings, extra: Sequence[Window] = ()) -> WindowSet:
+    """The live window identities behind pixels, plus any named separately."""
+    if s.work:
+        handles = shown_windows(desk, s)
+        windows = [w for w in desk.layers if w.hwnd in handles]
+    else:
+        windows = [w for w in desk.layers if w.is_app and not w.minimized and shown(w, s)]
+    return frozenset(
+        (w.hwnd, w.process.lower(), w.pid)
+        for w in [*windows, *(w for w in extra if shown(w, s))]
+    )
 
 
 def _root_owner(desk: Desktop, w: Window) -> Window | None:

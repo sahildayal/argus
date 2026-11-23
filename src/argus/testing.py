@@ -202,6 +202,7 @@ async def wait_for(
     quiet: float = 1.5,
     sleep: Callable[[float], Awaitable[None]] | None = None,
     progress: Callable[[float, str], Awaitable[None]] | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> WaitResult:
     """Poll *grab* until the condition holds or *timeout* passes.
 
@@ -215,10 +216,10 @@ async def wait_for(
         raise ArgusError(f'until="{until}" needs the text to look for.')
     if until not in ("change", "stable", "text", "text_gone"):
         raise ArgusError('until must be "change", "stable", "text" or "text_gone".')
-    start = time.monotonic()
+    start = clock()
 
     def elapsed() -> float:
-        return time.monotonic() - start
+        return clock() - start
 
     try:
         first = await grab()
@@ -240,11 +241,11 @@ async def wait_for(
         elif until == "change" and polls:
             d = diff(first.image, last.image)
             if d.changed >= min_change:
-                last = await _settle(grab, last, sleep, min_change)
+                last = await _settle(grab, last, sleep, min_change, clock)
                 return WaitResult(True, last, elapsed(), f"the screen changed ({diff(first.image, last.image).percent} of pixels)", diff(first.image, last.image))
         elif until == "stable" and polls:
             d = diff(previous.image, last.image)
-            now = time.monotonic()
+            now = clock()
             if d.changed < min_change:
                 quiet_since = quiet_since or now
                 if now - quiet_since >= quiet:
@@ -274,12 +275,12 @@ async def wait_for(
         polls += 1
 
 
-async def _settle(grab, shot: Shot, sleep, min_change: float, settle: float = 0.6, limit: float = 5.0) -> Shot:
+async def _settle(grab, shot: Shot, sleep, min_change: float, clock, settle: float = 0.6, limit: float = 5.0) -> Shot:
     """After a change, wait until consecutive frames agree (animations, repaints)."""
-    start = time.monotonic()
+    start = clock()
     current = shot
-    calm_since = time.monotonic()
-    while time.monotonic() - start < limit:
+    calm_since = clock()
+    while clock() - start < limit:
         await sleep(0.2)
         try:
             nxt = await grab()
@@ -288,8 +289,8 @@ async def _settle(grab, shot: Shot, sleep, min_change: float, settle: float = 0.
         except ArgusError:
             return current
         if diff(current.image, nxt.image).changed >= min_change:
-            calm_since = time.monotonic()
+            calm_since = clock()
         current = nxt
-        if time.monotonic() - calm_since >= settle:
+        if clock() - calm_since >= settle:
             break
     return current

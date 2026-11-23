@@ -20,8 +20,10 @@ from PIL import Image, ImageDraw
 
 from . import privacy, win32
 from .capture import capture_monitor, capture_window
-from .config import config_path, home, parse_hotkey, pretty_hotkey, set_profile, settings
+from .config import config_path, home, parse_hotkey, pretty_hotkey, set_profile, settings, tray_mutex_name
 from .desktop import NO_HOST, ArgusError, set_host, snapshot
+from .gate_pipe import PipeServer
+from .gate_ui import Approvals
 from .geometry import Rect
 from .marks import marks_dir, save_mark
 
@@ -84,6 +86,8 @@ class TrayApp:
         self.events: queue.Queue = queue.Queue()
         self.root = tk.Tk()
         self.root.withdraw()
+        self.approvals = Approvals(self.root)
+        self.pipe = PipeServer(self.approvals.answer)
         s = settings()
         self.hotkeys = Hotkeys(self.events, {1: ("mark", s.hotkey_mark), 2: ("pause", s.hotkey_pause)})
         self.paused = privacy.pause_state().paused
@@ -126,6 +130,7 @@ class TrayApp:
                     ),
                 ),
             ),
+            pystray.MenuItem("Revoke trust", lambda: post(("revoke", None))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Open captures folder", lambda: post(("open", home() / "captures"))),
             pystray.MenuItem("Open marks folder", lambda: post(("open", marks_dir()))),
@@ -145,12 +150,20 @@ class TrayApp:
     # -- loop ----------------------------------------------------------------------
 
     def run(self) -> None:
+        try:
+            self.pipe.start()
+        except OSError:
+            log.warning("Could not start the Argus approval pipe")
         self.hotkeys.start()
         self.icon.run_detached()
         self.root.after(50, self._poll)
         self.root.after(1000, self._tick)
         log.info("tray started")
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            self.approvals.close()
+            self.pipe.close()
 
     def _poll(self) -> None:
         try:
@@ -159,6 +172,7 @@ class TrayApp:
                 self._handle(action, arg)
         except queue.Empty:
             pass
+        self.approvals.poll()
         self.root.after(50, self._poll)
 
     def _tick(self) -> None:
@@ -183,6 +197,8 @@ class TrayApp:
                 self.pill("Argus paused for 15 minutes: AI tools can't see your screens", WARN)
             elif action == "profile":
                 self.switch_profile(arg)
+            elif action == "revoke":
+                self.approvals.trust.revoke()
             elif action == "open":
                 os.startfile(arg)  # noqa: S606 - opening our own folders/files
             elif action == "hotkeys" and arg:
@@ -297,7 +313,7 @@ def _setup_logging() -> None:
 
 def main() -> None:
     _setup_logging()
-    lock = win32.single_instance("Local\\ArgusTray")
+    lock = win32.single_instance(tray_mutex_name())
     if lock is None:
         log.info("tray already running; exiting")
         return

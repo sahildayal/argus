@@ -375,6 +375,8 @@ def snapshot(host: Host | None = None) -> Desktop:
 
     layers = []
     for z, h in enumerate(win32.top_level_windows()):
+        if win32.GetPropW(h, win32.APPROVAL_PREVIEW):
+            continue  # never list or PrintWindow an in-progress Argus approval
         if not win32.IsWindowVisible(h) or win32.is_cloaked(h):
             continue
         minimized = bool(win32.IsIconic(h))

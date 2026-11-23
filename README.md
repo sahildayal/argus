@@ -167,6 +167,41 @@ deliberate choice:
   (a snip can't be redacted), unless you set `allow_snip_folder = true`.
   Captures, marks and baselines taken under the personal profile aren't
   shown again after you switch to work.
+- **Approve sharing from the tray.** In the work profile, the Argus tray queues
+  requests from all MCP clients and shows one always-on-top preview at a time.
+  Review the image and text tabs, then choose **Send**, **Deny** (or Esc), or
+  **Send & trust these windows for 10 min** where available. Enter leaves the
+  request pending. A timeout declines the share. If the tray is unavailable,
+  start or check `argus-tray` and retry.
+
+  ```toml
+  [gate]
+  # enabled = true  # opt in to approvals in personal; work always asks
+  timeout_seconds = 30
+  trust_minutes = 10
+  ```
+
+  Trust follows the allowed window handles and their processes. If the visible
+  allowed windows are a subset of the approved set, a matching capture can
+  pass for that duration. A new window triggers a review. Content or tabs can
+  change inside a trusted window. Use **Revoke trust** on the tray menu to end
+  the grant. Pausing, switching profiles, or restarting the tray clears it.
+
+  | MCP tool | Approval when the gate is on |
+  | --- | --- |
+  | `screenshot`, `look` | Review rendered images and all captions and leads. Live window scopes can use trust. |
+  | `list_screens` | Review the exact inventory text each time. A paused status has no screen data. |
+  | `latest_snip`, `latest_mark` | Review images and text each time. A saved or clipboard image has no live trust scope. |
+  | `zoom`, `read_text`, `find_text` | Review images and OCR text unless the source image was already shared by this MCP server under the current settings. Approving OCR text alone doesn't authorize the source image. |
+  | `compare` | Review the diff and captions, including a text-only no-change result. A comparison can take one fresh frame. |
+  | `wait_for` | Review once per consecutive window set. When the set changes, review the previous frame before the watch continues. Review the exact final result before it is sent. The watch clock stops during interim review. |
+  | `save_baseline` | Save locally and return a receipt with the baseline name. |
+
+  The CLI still runs directly. Tray previews travel through a local Windows
+  pipe restricted to the current user and scoped to their session. Argus checks the pipe
+  server's process and user before sending anything. Software already running
+  as your Windows user can still tamper with the tray, its files or its input.
+  Captures continue to use local storage and the configured retention period.
 - **Blacked out before anything leaves Argus:** password managers, WhatsApp,
   Signal, Telegram, Messenger, Phone Link, Windows notification toasts, and
   browser tabs whose titles match banking/payments/messaging patterns. The AI
@@ -182,8 +217,7 @@ deliberate choice:
   uploads anything, has no telemetry, and makes no network requests.
 - **Prompt injection:** anything on screen is input to the agent. A web page or
   document could try to steer an agent into capturing something. Keep
-  per-capture prompts on (the default) unless you trust your setup, and pause
-  Argus around sensitive work.
+  per-capture prompts on for sensitive work and pause Argus when needed.
 
 Everything personal lives in `~/.argus/` (settings, captures, marks, baselines and
 logs), never in this repository. Set `ARGUS_HOME` to move it.

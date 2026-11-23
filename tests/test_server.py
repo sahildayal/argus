@@ -9,11 +9,12 @@ import pytest
 from mcp import Client
 from PIL import Image
 
-from argus import server
+from argus import gate, server, service
 from argus.capture import Shot
-from argus.desktop import ArgusError
+from argus.config import set_profile
+from argus.desktop import NO_HOST, ArgusError
 from argus.imaging import render
-from argus.service import Result
+from argus.service import Result, Session
 from argus.store import Store
 
 
@@ -106,3 +107,180 @@ def test_bad_arguments_are_rejected(stub):
 def test_list_screens_is_text_only(stub):
     r = call("list_screens")
     assert [c.type for c in r.content] == ["text"] and "Monitors" in r.content[0].text
+
+
+def test_unapproved_result_and_error_contain_no_screen_data(stub, monkeypatch):
+    set_profile("work")
+    seen = []
+
+    def deny(preview):
+        seen.append(preview)
+        return "denied"
+
+    monkeypatch.setattr(gate, "_transport", deny)
+    for name, args in [("look", {}), ("list_screens", {}), ("screenshot", {"monitor": "9"})]:
+        r = call(name, args)
+        assert [(c.type, c.text) for c in r.content] == [("text", gate.DECLINED)]
+    assert b"PNG" in seen[0].images[0][:8]
+    assert "Google Chrome" in seen[0].text[1]
+    assert seen[1].text == ("Monitors (numbered left to right): ...",)
+    assert seen[2].text == ("There is no monitor 9.",)
+
+
+def test_unavailable_gate_is_an_mcp_error(stub, monkeypatch):
+    set_profile("work")
+
+    def unavailable(_preview):
+        raise OSError("internal transport details")
+
+    monkeypatch.setattr(gate, "_transport", unavailable)
+    r = call("look")
+    assert r.is_error
+    assert len(r.content) == 1
+    assert gate.UNAVAILABLE in r.content[0].text
+    assert "internal transport details" not in r.content[0].text
+
+
+@pytest.fixture
+def capture_session(monkeypatch):
+    set_profile("work")
+    windows = frozenset({(10, "example.exe", 100)})
+    shot = Shot(Image.new("RGB", (40, 32), "navy"), "region", "Private text", (0, 0),
+                {"region": [0, 0, 40, 32]}, profile="work", share_windows=windows)
+    s = Session(host=NO_HOST, track=False)
+    monkeypatch.setattr(server, "_session", s)
+    monkeypatch.setattr(s, "desk", lambda: None)
+    monkeypatch.setattr(service, "capture", lambda *_a: [shot])
+    return s, shot
+
+
+def test_approved_capture_allows_zoom_and_ocr(capture_session, monkeypatch):
+    seen = []
+
+    def approve(preview):
+        seen.append(preview)
+        return "user"
+
+    async def read(_image):
+        return []
+
+    monkeypatch.setattr(gate, "_transport", approve)
+    monkeypatch.setattr(service.ocr, "read", read)
+    result = call("screenshot")
+    assert [c.type for c in result.content] == ["text", "image"]
+    assert seen[0].text == (result.content[0].text,)
+    assert seen[0].images == (base64.b64decode(result.content[1].data),)
+    assert not call("zoom", {"capture_id": "c1", "box": [0, 0, 10, 10]}).is_error
+    assert not call("read_text", {"capture_id": "c1"}).is_error
+    assert not call("find_text", {"capture_id": "c1", "text": "private"}).is_error
+    assert [p.tool for p in seen] == ["screenshot"]
+
+
+def test_ocr_approval_does_not_approve_the_source_image(capture_session, monkeypatch):
+    seen = []
+
+    def answer(preview):
+        seen.append(preview)
+        return "user" if preview.tool == "read_text" else "denied"
+
+    async def read(_image):
+        return []
+
+    monkeypatch.setattr(gate, "_transport", answer)
+    monkeypatch.setattr(service.ocr, "read", read)
+    call("read_text")
+    result = call("zoom", {"capture_id": "c1", "box": [0, 0, 10, 10]})
+    assert [p.tool for p in seen] == ["read_text", "zoom"]
+    assert "Private text" in seen[0].text[0] and not seen[0].images
+    assert [(c.type, c.text) for c in result.content] == [("text", gate.DECLINED)]
+
+
+def test_baseline_local_receipt_and_cli_session_bypass(capture_session, monkeypatch):
+    s, _ = capture_session
+
+    def fail(_preview):
+        pytest.fail("local save and CLI must not use the approval pipe")
+
+    monkeypatch.setattr(gate, "_transport", fail)
+    result = call("save_baseline", {"name": "reference"})
+    assert [(c.type, c.text) for c in result.content] == [("text", "Saved baseline 'reference'.")]
+    assert service.testing.load_baseline("reference").label == "Private text"
+    assert s.screenshot().captures[0].shot.label == "Private text"
+
+
+def test_latest_snip_gates_clipboard_image(capture_session, monkeypatch):
+    from argus.snips import Snip
+
+    _, shot = capture_session
+    monkeypatch.setattr(service, "latest_snips", lambda *_a, **kw: [Snip(shot.image, "clipboard", None, shot.taken)])
+    seen = []
+
+    def answer(preview):
+        seen.append(preview)
+        return "denied"
+
+    monkeypatch.setattr(gate, "_transport", answer)
+    result = call("latest_snip")
+    assert [(c.type, c.text) for c in result.content] == [("text", gate.DECLINED)]
+    assert seen[0].images and seen[0].windows is None
+    assert "image on the clipboard" in seen[0].text[0]
+
+
+def test_text_only_compare_is_gated(capture_session, monkeypatch):
+    _, shot = capture_session
+    call("save_baseline", {"name": "reference"})
+    monkeypatch.setattr(service, "recapture", lambda *_a: shot)
+
+    def answer(preview):
+        assert not preview.images
+        assert preview.text[0].startswith("No visible change")
+        return "denied"
+
+    monkeypatch.setattr(gate, "_transport", answer)
+    result = call("compare", {"baseline": "reference"})
+    assert [(c.type, c.text) for c in result.content] == [("text", gate.DECLINED)]
+
+
+@pytest.mark.parametrize(("second_reply", "denied"), [("user", False), ("timeout", True)])
+def test_wait_prompts_again_on_window_change(capture_session, monkeypatch, second_reply, denied):
+    from dataclasses import replace
+
+    _, shot = capture_session
+    new = replace(shot, share_windows=shot.share_windows | {(20, "other.exe", 200)})
+    frames = iter([shot, new])
+    seen = []
+
+    def answer(preview):
+        seen.append(preview)
+        return "user" if len(seen) == 1 else second_reply
+
+    async def read(_image):
+        return []
+
+    remaining = iter([[], [], [object()]])
+    original_wait = service.testing.wait_for
+
+    async def no_sleep(_seconds):
+        pass
+
+    async def run_wait(*args, **kwargs):
+        return await original_wait(*args, **kwargs, sleep=no_sleep)
+
+    monkeypatch.setattr(service, "recapture", lambda *_a: next(frames))
+    monkeypatch.setattr(service.testing, "wait_for", run_wait)
+    monkeypatch.setattr(service.ocr, "read", read)
+    monkeypatch.setattr(
+        service.ocr, "find",
+        lambda *_a: [service.ocr.Match("done", "done", (1, 1, 6, 6), 1.0)] if next(remaining) else [],
+    )
+    monkeypatch.setattr(gate, "_transport", answer)
+    result = call("wait_for", {"until": "text", "text": "done"})
+    assert [p.windows for p in seen] == [shot.share_windows, new.share_windows]
+    assert seen[0].watching and not seen[1].watching and not seen[1].allow_trust
+    if denied:
+        assert [(c.type, c.text) for c in result.content] == [("text", gate.DECLINED)]
+    else:
+        assert not result.is_error
+        assert [c.type for c in result.content] == ["text", "text", "image"]
+        assert seen[1].text == tuple(c.text for c in result.content if c.type == "text")
+        assert seen[1].images == (base64.b64decode(result.content[-1].data),)
