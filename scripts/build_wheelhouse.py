@@ -169,6 +169,8 @@ def plan_wheels(packages: dict[str, dict], pythons: tuple[str, ...]) -> list[Whe
             ranked = []
             for w in pkg.get("wheels", []):
                 filename = w["url"].rsplit("/", 1)[1]
+                if not filename.endswith(".whl") or any(c in filename for c in '/\:') or ".." in filename:
+                    raise SystemExit(f"refusing suspicious wheel filename from uv.lock: {filename!r}")
                 rank = wheel_rank(filename, minor)
                 if rank is not None:
                     ranked.append((rank, filename, w))
@@ -251,10 +253,10 @@ Full guide: docs/enterprise-install.md in the Argus repository.
 
 2. Install, using the system Python and no network:
    $env:UV_PYTHON_PREFERENCE = "only-system"
-   uv tool install --offline --no-index --find-links . argus-screens
+   uv tool install --offline --no-index --find-links . --no-managed-python --no-python-downloads argus-screens==@VERSION@
 
    Strict alternative that also enforces every hash in requirements.txt:
-   uv venv "$env:LOCALAPPDATA\\Argus\\venv"
+   uv venv --no-managed-python --no-python-downloads "$env:LOCALAPPDATA\\Argus\\venv"
    uv pip install --python "$env:LOCALAPPDATA\\Argus\\venv\\Scripts\\python.exe" --offline --no-index --find-links . --require-hashes -r requirements.txt
 
 3. Then: argus install   (strict alternative: "$env:LOCALAPPDATA\\Argus\\venv\\Scripts\\argus.exe" install)
@@ -328,7 +330,8 @@ def main() -> int:
     print(f"argus wheel: {argus.name}")
 
     (out / "requirements.txt").write_text(requirements_text(wheels, argus), encoding="utf-8", newline="\n")
-    (out / "INSTALL.txt").write_text(INSTALL_TXT, encoding="utf-8", newline="\n")
+    version = argus.name.split("-")[1]  # argus_screens-<version>-py3-none-any.whl
+    (out / "INSTALL.txt").write_text(INSTALL_TXT.replace("@VERSION@", version), encoding="utf-8", newline="\n")
     names = write_sums(out)
     print(f"wrote SHA256SUMS ({len(names)} files) in {out}")
     return 0

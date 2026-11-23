@@ -144,8 +144,8 @@ of building one from the checkout. It does not resolve anything. It reads `uv.lo
 keeps the wheels for `win_amd64` and CPython 3.12 and 3.13, downloads each from the URL
 recorded there, and refuses to keep a file whose SHA-256 differs from the one in the
 lock. A package with no suitable wheel stops the build, because an offline install can't
-compile from source. With the current lock that is 53 dependency wheels, about 41 MB, and
-the whole build took about ten seconds here. Downloads honour the usual `HTTPS_PROXY`
+compile from source. Expect around 50 dependency wheels (roughly 40 MB) and a build of
+under a minute. Downloads honour the usual `HTTPS_PROXY`
 settings.
 
 The folder contains:

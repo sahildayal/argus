@@ -23,7 +23,7 @@ jobs:
         run: uv sync --locked
       - name: constraints/requirements-lock.txt matches uv.lock
         # Fails when dependencies change without re-exporting. Fix: python scripts/export_constraints.py
-        run: python scripts/export_constraints.py --check
+        run: uv run --no-project python scripts/export_constraints.py --check
       - name: Unit tests (fake desktops; live tests need a real one)
         run: uv run pytest -q
       - name: CLI smoke test
