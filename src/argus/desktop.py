@@ -112,6 +112,11 @@ class Window:
     rect_exact: bool = True  # False when the frame rect came from a fallback (may include borders)
     app_pid: int = 0  # the hosted app's process for UWP frames (ApplicationFrameHost), else 0
     attributed: bool = True  # False when the owning app couldn't be identified unambiguously
+    layered: bool = False  # WS_EX_LAYERED: may be translucent or per-pixel alpha
+    colorkey: bool = False  # a layered window that keys out one colour (see-through holes)
+    # Every owner up the chain, nearest first: (HWND, PID), invisible owners
+    # included. Empty means "only *owner* is known" (hand-made windows).
+    owner_chain: tuple[tuple[int, int], ...] = ()
 
     @property
     def app_process_id(self) -> int:
@@ -122,6 +127,13 @@ class Window:
     def transparent(self) -> bool:
         """Provably invisible: a layered window with constant alpha 0."""
         return self.alpha == 0
+
+    @property
+    def opaque(self) -> bool:
+        """Provably opaque: not layered, or layered with constant alpha 255 and
+        no colour key. A per-pixel-alpha window (UpdateLayeredWindow) never is:
+        whatever is behind it may show through."""
+        return not self.layered or (self.alpha == 255 and not self.colorkey)
 
     @property
     def handle(self) -> str:
@@ -425,9 +437,11 @@ def snapshot(host: Host | None = None) -> Desktop:
         cls = win32.class_name(h)
         pid = win32.window_pid(h)
         process, exe = _process(pid)
-        alpha = win32.layered_alpha(h) if ex & win32.WS_EX_LAYERED else None
+        layered = bool(ex & win32.WS_EX_LAYERED)
+        alpha, colorkey = win32.layered_attributes(h) if layered else (None, False)
         see_through = bool(ex & win32.WS_EX_TRANSPARENT) or alpha == 0
         own = win32.owner(h)
+        chain = _owner_chain(own)
         is_app = (
             not see_through
             and cls not in _SHELL_CLASSES
@@ -449,9 +463,29 @@ def snapshot(host: Host | None = None) -> Desktop:
             minimized=minimized, maximized=bool(win32.IsZoomed(h)), topmost=bool(ex & win32.WS_EX_TOPMOST),
             see_through=see_through, is_app=is_app, owner=own, monitor=mon,
             alpha=alpha, rect_exact=exact, app_pid=app_pid, attributed=attributed,
+            layered=layered, colorkey=colorkey, owner_chain=chain,
         )
         layers.append(_with_host(w, host))
     return Desktop(tuple(monitors), tuple(layers), cursor, fg, under, host, time.time(), refresh=lambda: snapshot(host))
+
+
+OWNER_CHAIN_LIMIT = 16
+
+
+def _owner_chain(first: int) -> tuple[tuple[int, int], ...]:
+    """(HWND, PID) of *first* and every owner above it. A chain that loops or is
+    too deep ends with (0, 0), which no check accepts."""
+    chain: list[tuple[int, int]] = []
+    seen: set[int] = set()
+    h = first
+    while h:
+        if h in seen or len(chain) >= OWNER_CHAIN_LIMIT:
+            chain.append((0, 0))
+            break
+        seen.add(h)
+        chain.append((h, win32.window_pid(h)))
+        h = win32.owner(h)
+    return tuple(chain)
 
 
 def _monitor_for(monitors: list[Monitor], rect: Rect) -> int | None:

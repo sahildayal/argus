@@ -202,7 +202,8 @@ def test_audit_config_defaults():
     assert s.profile == "work"
     assert s.requires_audit is True
 
-    # Opt-in in personal
+    # Opt-in in personal (work is sticky: switch back explicitly first)
+    set_profile("personal")
     config_path().write_text('[profile]\nactive = "personal"\n[audit]\nenabled = true\n', encoding="utf-8")
     s = settings()
     assert s.profile == "personal"

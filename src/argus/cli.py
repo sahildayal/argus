@@ -371,6 +371,8 @@ def _profile_cmd(args) -> int:
         try:
             s = config.set_profile(args.name)
         except ValueError as exc:
+            if config.settings().work and args.name.strip().lower() == "work":
+                raise ArgusError(f"{exc}. The work profile is on anyway: Argus remembers the switch.") from None
             raise ArgusError(str(exc)) from None
         print(f"Switched to the {s.profile} profile. It applies to the next capture.")
     else:
@@ -378,6 +380,8 @@ def _profile_cmd(args) -> int:
         print(f"Active profile: {s.profile}")
     if s.work:
         apps = ", ".join(sorted(s.allow_apps)) or "none"
+        if s.profile_reason:
+            print(f"Why work: {s.profile_reason}.")
         print("Only allowed windows are visible; everything else is blacked out and titles are hidden.")
         print(f"Allowed apps: {apps}")
         print(f"Allowed browser-tab patterns: {', '.join(p.pattern for p in s.allow_browser_titles) or 'none'}")

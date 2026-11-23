@@ -104,6 +104,8 @@ class TrayApp:
             f"Argus: {state}, {s.profile} profile\n"
             f"Mark: {pretty_hotkey(s.hotkey_mark)} | Pause: {pretty_hotkey(s.hotkey_pause)}"
         )
+        if s.work and s.configured != "work":
+            title += "\nWork kept on" + (" with nothing allowed" if s.lockdown else "") + ": see `argus status`"
         if s.problems:
             title += f"\nConfig problem ({len(s.problems)}): see `argus status`"
         return title[:127]  # the notification-area tooltip limit
@@ -252,7 +254,11 @@ class TrayApp:
             s = set_profile(name)
         except ValueError as exc:
             log.warning("profile switch failed: %s", exc)
-            self.pill("Argus couldn't switch profile: fix config.toml first", WARN, ms=3000)
+            if name == "work" and settings().work:  # the switch is remembered even so
+                self._refresh()
+                self.pill("Argus work profile is on, but config.toml couldn't be updated: see argus status", ACCENT, ms=3000)
+            else:
+                self.pill("Argus couldn't switch profile: fix config.toml first", WARN, ms=3000)
             return
         self._refresh()
         if s.work:

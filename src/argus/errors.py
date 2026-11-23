@@ -27,14 +27,23 @@ def work_profile() -> bool:
         return True
 
 
+# File types Argus keeps in its data folder. A path is scrubbed up to the last
+# of these on its line (or to the end of the line), so a file name with spaces,
+# commas or brackets - "Scan [Doe, John] 2026.png" - goes with it.
+_DATA_EXTS = r"(?:png|jpe?g|jsonl|json|toml|log|key|txt)"
+
+
 def _data_path_pattern() -> re.Pattern:
     parts = [p for p in re.split(r"[\\/]+", str(home())) if p]
     sep = r"[\\/]+"
-    return re.compile(sep.join(re.escape(p) for p in parts) + r"""(?:[\\/][^\s"'<>|()\[\]]*)?""", re.IGNORECASE)
+    rest = rf"(?:[\\/][^\r\n]*\.{_DATA_EXTS}(?:\.(?:part|tmp))?(?![A-Za-z0-9])|[\\/][^\r\n]*)?"
+    return re.compile(sep.join(re.escape(p) for p in parts) + rest, re.IGNORECASE)
 
 
 def scrub(text: str) -> str:
-    """*text* without paths into Argus's data folder (work profile only)."""
+    """*text* without paths into Argus's data folder (work profile only): the
+    folder and everything after it up to the last known file extension on the
+    line, or the rest of the line. Over-scrubbing beats leaking a file name."""
     if not work_profile():
         return text
     try:

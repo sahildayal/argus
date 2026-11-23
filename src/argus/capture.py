@@ -15,7 +15,7 @@ from . import win32
 from .config import Settings
 from .desktop import ArgusError, Desktop, Monitor, Window, find_monitors, find_windows
 from .geometry import Rect
-from .privacy import WindowSet, check_window, display_name, named_windows, redact, sensitive_reason, share_scope, shown
+from .privacy import WindowSet, check_window, display_name, named_windows, redact, sensitive_reason, share_scope, shown, work_mask
 
 
 @dataclass
@@ -37,6 +37,7 @@ class Shot:
     share_windows: WindowSet | None = None  # live provenance, never loaded from a PNG
     policy: str = ""  # Settings.policy it was redacted under ("" = unknown or not authenticated)
     allow_trust: bool = True  # captions can name windows outside the pixel scope
+    sealed: bool = False  # reopened from a PNG whose Argus seal checked out (its metadata is authentic)
 
     @property
     def cursor_in_image(self) -> tuple[int, int] | None:
@@ -70,14 +71,27 @@ class ScreenChanged(ArgusError):
     """The desktop kept changing while a work-profile capture was being taken."""
 
 
+def _owners(w: Window, desk: Desktop, s: Settings) -> tuple:
+    """*w*'s full owner chain as it bears on the work profile: each owner's
+    handle and process, and for visible owners their position, state and verdict."""
+    out = []
+    chain = (w.owner_chain or ((w.owner, 0),)) if w.owner else ()
+    for hwnd, pid in chain:
+        o = desk.window(hwnd) if hwnd else None
+        out.append((hwnd, pid) if o is None else (hwnd, pid, o.pid, o.app_pid, o.rect, o.z, o.minimized, shown(o, s)))
+    return tuple(out)
+
+
 def _layout(desk: Desktop, area: Rect, s: Settings) -> tuple:
     """Everything about *desk* that decides how *area* gets redacted in the work
     profile: the monitors, the foreground window and, front to back, every window
-    that touches the area with its position, process, owner, transparency and
-    allow/block verdict (which covers title changes that matter)."""
+    that touches the area with its position, process, maximized state, full owner
+    chain, transparency and allow/block verdict (which covers title changes
+    that matter). Compared in addition to the mask itself (see `_grab_redacted`)."""
     windows = tuple(
-        (w.hwnd, w.rect, w.pid, w.app_pid, w.process.lower(), w.owner, w.cls, w.minimized, w.see_through, w.alpha,
-         w.rect_exact, w.attributed, w.is_app, shown(w, s), sensitive_reason(w, s) is not None)
+        (w.hwnd, w.rect, w.pid, w.app_pid, w.process.lower(), w.owner, _owners(w, desk, s), w.cls, w.minimized,
+         w.maximized, w.see_through, w.alpha, w.layered, w.colorkey, w.rect_exact, w.attributed, w.is_app,
+         shown(w, s), sensitive_reason(w, s) is not None)
         for w in desk.layers
         if w.minimized or w.rect.intersect(area)
     )
@@ -87,16 +101,32 @@ def _layout(desk: Desktop, area: Rect, s: Settings) -> tuple:
     return monitors, desk.foreground, windows, hidden_pids
 
 
+def _same_redaction(before: Desktop, after: Desktop, area: Rect, s: Settings) -> bool:
+    """Would *area* be redacted pixel-for-pixel the same against both snapshots?
+    The masks themselves are compared, so no field that matters can be missed."""
+    if _layout(before, area, s) != _layout(after, area, s):
+        return False
+    mask_before, _, _ = work_mask(area, before, s)
+    mask_after, _, _ = work_mask(area, after, s)
+    return mask_before.tobytes() == mask_after.tobytes()
+
+
 def _grab_redacted(desk: Desktop, s: Settings, area_of: Callable[[Desktop], Rect]) -> tuple[Image.Image, Rect, list[str], Desktop]:
     """Grab and redact the area *area_of(desk)*. Returns (image, area, hidden, the
     desktop it was redacted against).
 
-    In the work profile the window list is read again right after the grab; if
-    anything that decides the redaction changed in between (a window opened,
-    moved, changed z-order, title or focus), the grab is retried, and after
-    GRAB_ATTEMPTS the capture is refused rather than risking a stale mask. A
-    window that appears and vanishes entirely between two snapshots can still
-    slip through - the confirm step is the backstop for that."""
+    In the work profile the window list is read again right after the grab and
+    the redaction mask is computed from both snapshots; unless the two masks are
+    pixel-identical (and nothing else that decides redaction changed - a window
+    opened, moved, changed z-order, owner, maximized state, title or focus), the
+    grab is retried, and after GRAB_ATTEMPTS the capture is refused rather than
+    risking a stale mask.
+
+    Limitation: a window that appears *and* disappears entirely between the two
+    snapshots (shown only while the pixels were being grabbed) can't be
+    detected this way - both snapshots agree and neither has it. The approval
+    gate's preview, which the user sees before anything leaves, is the
+    backstop for that."""
     if not s.work:
         area = area_of(desk)
         img = grab(area)
@@ -114,7 +144,7 @@ def _grab_redacted(desk: Desktop, s: Settings, area_of: Callable[[Desktop], Rect
         area = area_of(before)
         img = grab(area)
         after = before.refresh()
-        if area_of(after) == area and _layout(before, area, s) == _layout(after, area, s):
+        if area_of(after) == area and _same_redaction(before, after, area, s):
             return img, area, redact(img, (area.x, area.y), after, s), after
         before = after
     raise ScreenChanged(

@@ -177,27 +177,44 @@ deliberate choice:
   off the list.
 
   The block list below still applies on top of the allow list. In the work
-  profile `latest_snip` only reads a bitmap on the clipboard (not the
-  Screenshots folder, and not files copied in Explorer), because a snip can't
-  be redacted, unless you set `allow_snip_folder = true`. Captures, marks and
-  baselines are stamped with the profile and a hash of the allow/block lists
-  and sealed with a per-install key (`~/.argus/seal.key`), so the work profile
-  only shows again images it redacted under its *current* settings: nothing
-  from the personal profile, from before you changed the lists, or from a
-  file Argus didn't write.
+  profile `latest_snip` only reads a bitmap on the clipboard, because a snip
+  can't be redacted. `allow_snip_folder = true` adds the Screenshots folder
+  and, separately, `allow_clipboard_files = true` adds image files copied in
+  Explorer. Snips are never stamped as work captures, so they can't be
+  reopened (or zoomed) later as verified ones, and while the work profile is
+  locked down (see below) `latest_snip` is refused. Captures, marks and
+  baselines are stamped with the profile, a hash of the allow/block lists and
+  Argus's redaction version, and sealed with a per-install key
+  (`~/.argus/seal.key`, re-read on every check: delete it and every old seal
+  stops verifying). So the work profile only shows again images it redacted
+  under its *current* settings: nothing from the personal profile, from before
+  you changed the lists or upgraded the masker, or from a file Argus didn't
+  write. Mark captions come from the sealed image, not the mark's JSON file.
+
+  Once switched on (tray, `argus profile work`, or `active = "work"` in the
+  file), work **stays on** until you switch it off with the tray or `argus
+  profile personal`: Argus records the choice in `~/.argus/profile.state`, so
+  an emptied, deleted, mangled or hand-edited `config.toml` can't quietly drop
+  you back to personal. `argus status` and the tray tooltip say why work is on.
 
   The work profile fails closed. A `config.toml` that doesn't parse, an
   unknown profile name, a setting of the wrong type or a broken regex in
-  `[profile]`, `[privacy]` or `[work]` switches to the work profile with
-  nothing allowed until you fix it (`argus status` and the tray tooltip say
-  what's wrong). Windows that might be drawing on top of an allowed one -
-  see-through or click-through overlays, popups that can't be tied to the
-  allowed window, UWP apps whose process can't be identified - are blacked
-  out, as are the rounded corners of allowed windows. If the windows on
-  screen change while a capture is being taken, Argus retries and then
-  refuses rather than risk a mask that doesn't match the pixels. It isn't
-  perfect: a window that appears and vanishes within one capture can still
-  slip through, so keep reviewing what you share.
+  `[profile]`, `[privacy]` or `[work]`, or an unknown section that looks like
+  a misspelling of one of those or `[gate]` (`[profiles]`, `[privcy]`),
+  switches to the work profile with nothing allowed until you fix it (`argus
+  status` and the tray tooltip say what's wrong). Windows that might be
+  drawing on top of an allowed one - see-through or click-through overlays,
+  popups and owned windows whose owner chain doesn't lead back to an allowed
+  window, UWP apps whose process can't be identified - are blacked out, as are
+  the rounded corners of allowed windows. An allowed window that is
+  translucent (a layered window without a provable alpha of 255, including
+  per-pixel-alpha windows) is blacked out whole, since what's behind it could
+  show through. Every work capture computes the redaction mask from the window
+  list before and after grabbing the pixels; unless the two masks are
+  identical, Argus retries and then refuses rather than risk a mask that
+  doesn't match the pixels. It isn't perfect: a window that appears and
+  vanishes entirely between those two looks can still slip through, which is
+  what the approval preview below is for, so keep reviewing what you share.
 
 - **Approve sharing from the tray.** In the work profile, the Argus tray queues
   requests from all MCP clients and shows one always-on-top preview at a time.
