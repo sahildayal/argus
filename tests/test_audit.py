@@ -209,12 +209,11 @@ def test_audit_config_defaults():
     assert s.audit_enabled is True
     assert s.requires_audit is True
 
-    # Opt-out in work
+    # The work profile can't opt out
     config_path().write_text('[profile]\nactive = "work"\n[audit]\nenabled = false\n', encoding="utf-8")
     s = settings()
     assert s.profile == "work"
-    assert s.audit_enabled is False
-    assert s.requires_audit is False
+    assert s.requires_audit is True
 
 
 def test_audit_retention_and_purge(tmp_path):
