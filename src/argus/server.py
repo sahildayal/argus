@@ -36,10 +36,6 @@ _policy: ContextVar[gate.Policy] = ContextVar("argus_approval_policy")
 _client_name: ContextVar[str | None] = ContextVar("argus_client_name", default=None)
 
 
-def current_client() -> str | None:
-    return _client_name.get()
-
-
 def session() -> Session:
     global _session
     if _session is None:
@@ -200,60 +196,15 @@ def _instructions() -> str:
 mcp = MCPServer("argus", title="Argus", version=__version__, instructions=_instructions())
 
 
-def _extract_client_name(ctx_or_session) -> str | None:
-    try:
-        session = getattr(ctx_or_session, "session", ctx_or_session)
-        client_params = getattr(session, "client_params", None)
-        client_info = getattr(client_params, "clientInfo", None)
-        if client_info and getattr(client_info, "name", None):
-            return str(client_info.name)
-    except Exception:
-        pass
-    return None
-
-
-orig_call_tool = mcp.call_tool
-
-
-async def _call_tool_with_client(name, arguments, context=None):
-    client_name = _extract_client_name(context)
-    token = _client_name.set(client_name)
-    try:
-        from . import audit
-        audit.set_current_client(client_name)
-    except Exception:
-        pass
-    try:
-        return await orig_call_tool(name, arguments, context)
-    finally:
-        _client_name.reset(token)
-        try:
-            from . import audit
-            audit.set_current_client(None)
-        except Exception:
-            pass
-
-
-mcp.call_tool = _call_tool_with_client
-
-
 async def _track_client_middleware(ctx, call_next):
-    client_name = _extract_client_name(ctx)
-    token = _client_name.set(client_name)
-    try:
-        from . import audit
-        audit.set_current_client(client_name)
-    except Exception:
-        pass
+    if ctx.method != "tools/call":
+        return await call_next(ctx)
+    params = ctx.session.client_params
+    token = _client_name.set(params.client_info.name if params is not None else None)
     try:
         return await call_next(ctx)
     finally:
         _client_name.reset(token)
-        try:
-            from . import audit
-            audit.set_current_client(None)
-        except Exception:
-            pass
 
 
 mcp._lowlevel_server.middleware.append(_track_client_middleware)

@@ -330,7 +330,13 @@ def _audit_cmd(args) -> int:
     elif action == "export":
         since = getattr(args, "since", None)
         out = args.out
-        count = audit.export_log(out, since=since)
+        try:
+            count = audit.export_log(
+                out, since=since, report_skipped=lambda n: print(f"Skipped {n} unparseable audit line(s)."),
+            )
+        except (OSError, ValueError) as exc:
+            print(f"argus audit: {exc}", file=sys.stderr)
+            return 1
         print(f"Exported {count} audit entry(ies) to {out}")
         return 0
     else:
