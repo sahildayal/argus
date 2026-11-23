@@ -7,12 +7,13 @@ import json
 import shutil
 import threading
 import time
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 from .config import Settings, home
-from .desktop import Desktop, Paused, Window
+from .desktop import _SHELL_CLASSES, _SHELL_PROCESSES, ArgusError, Desktop, Paused, Window
 from .geometry import Rect
 from .imaging import load_font
 
@@ -37,6 +38,11 @@ def _pause_file():
     return home() / "paused.json"
 
 
+def pause_revision_file():
+    """A persistent marker so the tray sees even a quick pause/resume."""
+    return home() / "gate-pause"
+
+
 def pause_state() -> PauseState:
     path = _pause_file()
     if not path.exists():
@@ -56,10 +62,13 @@ def pause(minutes: float | None = None) -> PauseState:
     now = time.time()
     until = now + minutes * 60 if minutes else None
     _pause_file().write_text(json.dumps({"since": now, "until": until}), encoding="utf-8")
+    pause_revision_file().touch()
     return PauseState(True, now, until)
 
 
 def resume() -> None:
+    if _pause_file().exists():
+        pause_revision_file().touch()
     _pause_file().unlink(missing_ok=True)
 
 
@@ -95,13 +104,288 @@ def sensitive_reason(w: Window, s: Settings) -> str | None:
     return None
 
 
+# ------------------------------------------------------------- work profile
+
+
+def allowed(w: Window, s: Settings) -> bool:
+    """May this window be seen at all? Always True in the personal profile; in
+    the work profile only windows on the [work] allow lists are (the block list
+    still applies on top - see `shown`). Shell surfaces (desktop, taskbar,
+    notifications, Start) and windows of unknown programs never are."""
+    if not s.work:
+        return True
+    process = w.process.lower()
+    if not process or not w.pid or w.cls in _SHELL_CLASSES or process in _SHELL_PROCESSES:
+        return False
+    if not w.attributed or process == "applicationframehost.exe":
+        return False  # a UWP frame whose app couldn't be pinned to one process
+    if process in s.allow_apps:
+        return True
+    if process in s.browsers and any(p.search(w.title) for p in s.allow_browser_titles):
+        return True
+    return any(p.search(w.title) for p in s.allow_titles)
+
+
+def shown(w: Window, s: Settings) -> bool:
+    """Allowed and not on the block list: its pixels and title may leave Argus."""
+    return allowed(w, s) and sensitive_reason(w, s) is None
+
+
+def display_name(w: Window, s: Settings) -> str:
+    """How Argus names a window to the AI (lists, captions, errors, logs). The
+    title is left out whenever the window is hidden by either profile."""
+    if not allowed(w, s):
+        return f"{w.app or w.process or 'unknown app'} (hidden, work profile)"
+    if sensitive_reason(w, s):
+        return f"{w.app or w.process} (title hidden, privacy list)"
+    return w.label
+
+
+def check_window(w: Window, s: Settings) -> None:
+    """Refuse to target a window the work profile doesn't allow."""
+    if not allowed(w, s):
+        raise ArgusError(
+            f"{display_name(w, s)} isn't allowed by the user's work profile, so Argus won't capture it or share its "
+            "title. Tell the user; only they can allow an app (under [work] in ~/.argus/config.toml). "
+            "Don't try to work around it."
+        )
+
+
+WORK_HIDDEN = "everything outside the allowed apps (work profile)"
+WORK_LABEL = "Hidden by Argus: work profile"
+WindowSet = frozenset[tuple[int, str, int]]  # HWND, executable name, PID
+
+
+def named_windows(windows: Iterable[Window], s: Settings) -> WindowSet:
+    """Window identities whose titles can appear in a result."""
+    return frozenset(window_identity(w) for w in windows if shown(w, s))
+
+
+def window_identity(w: Window) -> tuple[int, str, int]:
+    return w.hwnd, w.process.lower(), w.pid
+
+
+def _uncovered(area: Rect, covered: Rect) -> Iterator[Rect]:
+    overlap = area.intersect(covered)
+    if overlap is None:
+        yield area
+        return
+    for remainder in (
+        Rect.ltrb(area.x, area.y, area.right, overlap.y),
+        Rect.ltrb(area.x, overlap.bottom, area.right, area.bottom),
+        Rect.ltrb(area.x, overlap.y, overlap.x, overlap.bottom),
+        Rect.ltrb(overlap.right, overlap.y, area.right, overlap.bottom),
+    ):
+        if not remainder.empty:
+            yield remainder
+
+
+def share_scope(desk: Desktop, s: Settings, region: Rect, *, target: Window | None = None) -> WindowSet:
+    """Allowed windows visible in the capture area, including its explicit target."""
+    handles = shown_windows(desk, s) if s.work else {w.hwnd for w in desk.windows if shown(w, s)}
+    scope = set() if target is None else set(named_windows([target], s))
+    remaining = [area for m in desk.monitors if (area := region.intersect(m.rect))]
+    # Match desktop redaction's layer order. A hidden window can still cover
+    # an allowed one, and windows can be covered by more than one layer.
+    for w in desk.layers:
+        if not remaining:
+            break
+        if w.minimized or w.see_through or not any(area.intersect(w.rect) for area in remaining):
+            continue
+        if w.hwnd in handles:
+            scope.add(window_identity(w))
+        remaining = [part for area in remaining for part in _uncovered(area, w.rect)]
+    return frozenset(scope)
+
+
+def _live(desk: Desktop) -> list[Window]:
+    """Windows that can put pixels on screen: not minimized, and not provably
+    invisible. See-through (click-through / layered) windows count: unless
+    their constant alpha is 0, they may well be drawing something."""
+    return [w for w in desk.layers if not w.minimized and not w.transparent]
+
+
+def _chain_owner(p: Window, by_hwnd: dict[int, Window]) -> Window | None | bool:
+    """Where *p*'s owner chain leads: its nearest visible owner (a Window); None
+    when every owner is an invisible window of *p*'s own process (no owner draws
+    anything); or False when the chain can't be trusted (an invisible owner in
+    another process or of unknown process, a loop, a chain too deep)."""
+    chain = p.owner_chain or ((p.owner, by_hwnd[p.owner].pid if p.owner in by_hwnd else 0),)
+    for hwnd, pid in chain:
+        owner = by_hwnd.get(hwnd) if hwnd else None
+        if owner is not None:
+            return owner
+        if not hwnd or not pid or pid != p.pid:
+            return False
+    return None
+
+
+def shown_windows(desk: Desktop, s: Settings) -> set[int]:
+    """Handles of the windows whose pixels the work profile reveals: allowed,
+    unblocked windows, plus menus/popups that can be attributed to one of them.
+
+    - Only unowned allowed windows seed the set. Every owned window - menus,
+      popups and owned dialogs alike, even one of an allowed exe with an empty
+      title - must pass owner-chain validation: its nearest visible owner was
+      itself revealed through an unbroken chain from an unowned allowed window,
+      belongs to the same process, and is behind it; owners in between may only
+      be invisible windows of the same process. One hidden, minimized or
+      foreign window anywhere in the chain hides it.
+    - An owned app window whose owners are all invisible windows of its own
+      process (an app's hidden "parking" window) counts as unowned.
+    - An unowned popup (or one with only invisible same-process owners) is
+      revealed only if its process has an allowed window it overlaps and sits in
+      front of, and that process shows no hidden windows at all (every Chrome
+      window shares one process, so with a hidden Chrome window open an unowned
+      popup could be the hidden window's).
+    - A popup of a UWP frame host, or of a process Argus can't read, never is."""
+    live = _live(desk)
+    by_hwnd = {w.hwnd: w for w in desk.layers}
+    tops = {w.hwnd: w for w in live if w.is_app and not w.owner and shown(w, s)}
+    chained = set(tops)  # revealed through an owner chain that starts at an allowed window
+    out = set(tops)
+    # Every app window that isn't shown counts, minimized ones too.
+    hidden_pids = {w.app_process_id for w in desk.layers if w.is_app and not shown(w, s)}
+    for p in sorted(live, key=lambda w: -w.z):  # back to front: owners come before what they own
+        if p.hwnd in out or p.see_through or not p.pid or not p.attributed:
+            continue
+        if p.cls in _SHELL_CLASSES or p.process.lower() in _SHELL_PROCESSES or p.process.lower() == "applicationframehost.exe":
+            continue
+        if sensitive_reason(p, s) or (p.is_app and not shown(p, s)):
+            continue
+        if p.owner:
+            owner = _chain_owner(p, by_hwnd)
+            if owner is False:
+                continue
+            if isinstance(owner, Window):
+                if owner.hwnd in chained and owner.app_process_id == p.app_process_id and p.z < owner.z:
+                    out.add(p.hwnd)
+                    chained.add(p.hwnd)
+                continue
+            if p.is_app:  # only invisible owners of its own process: like an unowned window
+                out.add(p.hwnd)
+                chained.add(p.hwnd)
+                tops[p.hwnd] = p
+                continue
+        elif p.is_app:
+            continue  # an unowned app window is only ever revealed as a seed
+        if p.app_process_id not in hidden_pids and any(
+            t.app_process_id == p.app_process_id and p.z < t.z and t.rect.intersect(p.rect) for t in tops.values()
+        ):
+            out.add(p.hwnd)
+    return out
+
+
+# Windows 11 rounds the corners of normal windows (8 px at 100% scaling), so a
+# window's frame rect includes a few corner pixels of whatever is behind it.
+# Revealed windows are drawn as rounded rects with that radius, inset by 1 px,
+# so those pixels stay hidden. Costs a sliver of the allowed window's corners.
+CORNER_RADIUS = 8
+REVEAL_INSET = 1
+
+
+def _reveal(draw: ImageDraw.ImageDraw, w: Window, region: Rect, desk: Desktop) -> None:
+    r = w.rect
+    inset = 0 if w.maximized else REVEAL_INSET
+    box = [r.x - region.x + inset, r.y - region.y + inset, r.right - region.x - 1 - inset, r.bottom - region.y - 1 - inset]
+    if box[2] < box[0] or box[3] < box[1]:
+        return
+    mon = desk.monitor(w.monitor) if w.monitor else desk.monitor_for(r)
+    radius = 0 if w.maximized else round(CORNER_RADIUS * (mon.dpi if mon else 96) / 96)
+    radius = min(radius, (box[2] - box[0]) // 2, (box[3] - box[1]) // 2)
+    if radius > 0:
+        draw.rounded_rectangle(box, radius=radius, fill=0)
+    else:
+        draw.rectangle(box, fill=0)
+
+
+def work_mask(region: Rect, desk: Desktop, s: Settings) -> tuple[Image.Image, set[str], set[int]]:
+    """The work profile's redaction mask for *region* (255 = hidden), computed
+    without painting anything: (mask, reasons, revealed handles). `_redact_work`
+    paints exactly this mask, and work captures require it to be identical
+    before and after the grab (capture._grab_redacted).
+
+    Fails closed: start fully hidden and paint windows back to front, revealing
+    the shown ones and re-hiding whatever covers them. Wallpaper, taskbar,
+    see-through overlays, windows that aren't provably opaque, any area no
+    window covers and anything off the physical monitors stay hidden."""
+    reveal = shown_windows(desk, s)
+    mask = Image.new("L", (region.w, region.h), 255)  # 255 = hidden
+    draw = ImageDraw.Draw(mask)
+
+    def local(r: Rect) -> list[int]:
+        return [r.x - region.x, r.y - region.y, r.right - region.x - 1, r.bottom - region.y - 1]
+
+    blocked: set[str] = set()
+    for w in reversed(_live(desk)):
+        inter = w.rect.intersect(region)
+        if not inter:
+            continue
+        if w.hwnd in reveal and w.rect_exact and w.opaque:
+            _reveal(draw, w, region, desk)
+        else:
+            # Hide the whole rectangle when we can't prove it covers the pixels beneath it.
+            draw.rectangle(local(inter), fill=255)
+            if w.hwnd in reveal and not w.rect_exact:
+                blocked.add("a window whose exact position Windows didn't report")
+            elif w.hwnd in reveal and w.region is not None and not w.region[2]:
+                blocked.add("a window whose region doesn't provably cover its rectangle")
+            elif w.hwnd in reveal:
+                blocked.add("a translucent window (Argus can't prove nothing shows through it)")
+            elif w.see_through:
+                blocked.add("see-through overlay windows")
+        if allowed(w, s) and (reason := sensitive_reason(w, s)):
+            blocked.add(reason)
+    # Only pixels on a physical monitor can belong to a window.
+    monitors = Image.new("L", mask.size, 255)
+    mdraw = ImageDraw.Draw(monitors)
+    for m in desk.monitors:
+        if inter := m.rect.intersect(region):
+            mdraw.rectangle(local(inter), fill=0)
+    return ImageChops.lighter(mask, monitors), blocked, reveal
+
+
+def _redact_work(img: Image.Image, region: Rect, desk: Desktop, s: Settings) -> list[str]:
+    """Allow-list redaction: paint `work_mask` over *img*, then label big hidden blocks."""
+    mask, blocked, reveal = work_mask(region, desk, s)
+    if not mask.getbbox():
+        return []
+    img.paste(SHADE, mask=mask)
+
+    # One label per big, (nearly) solid hidden block - not one per sliver.
+    candidates = [w.rect for w in desk.layers if not w.minimized and w.hwnd not in reveal]
+    candidates += [m.rect for m in desk.monitors] + [region]
+    placed: list[tuple[int, int, int, int]] = []
+    for r in sorted(candidates, key=lambda r: -r.area):
+        inter = r.intersect(region)
+        if not inter or inter.w < 300 or inter.h < 120:
+            continue
+        box = (inter.x - region.x, inter.y - region.y, inter.right - region.x, inter.bottom - region.y)
+        if any(box[0] < b[2] and b[0] < box[2] and box[1] < b[3] and b[1] < box[3] for b in placed):
+            continue
+        if mask.crop(box).histogram()[255] < 0.9 * inter.area:
+            continue
+        if mask.getpixel(((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)) != 255:
+            continue
+        _label(img, box, WORK_LABEL)
+        placed.append(box)
+        if len(placed) >= 8:
+            break
+    return [WORK_HIDDEN, *sorted(blocked)]
+
+
+# ---------------------------------------------------------------- block list
+
 SHADE = (24, 24, 27)
 
 
 def redact(img: Image.Image, origin: tuple[int, int], desk: Desktop, s: Settings) -> list[str]:
     """Black out every sensitive window visible in *img* (which shows the desktop
-    area starting at *origin*). Returns the reasons, one per window hidden."""
+    area starting at *origin*). Returns the reasons, one per window hidden. In
+    the work profile, everything but the allowed windows is blacked out instead."""
     region = Rect(origin[0], origin[1], img.width, img.height)
+    if s.work:
+        return _redact_work(img, region, desk, s)
     hidden: list[str] = []
     for w in desk.layers:
         if w.minimized or w.see_through:
@@ -186,6 +470,8 @@ def cleanup(s: Settings, force: bool = False) -> int:
                 sub.rmdir()  # only succeeds when empty
             except OSError:
                 pass
+    from . import audit
+    removed += audit.cleanup_audit(s.audit_retention_months)
     return removed
 
 

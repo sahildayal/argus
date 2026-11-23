@@ -18,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import home
+from .config import home, tray_mutex_name
 from .desktop import ArgusError
 
 NAME = "argus"
@@ -293,7 +293,7 @@ def start_tray(tray: str) -> None:
 def tray_running() -> bool:
     from . import win32
 
-    handle = win32.CreateMutexW(None, False, "Local\\ArgusTray")
+    handle = win32.CreateMutexW(None, False, tray_mutex_name())
     import ctypes
 
     exists = ctypes.get_last_error() == win32.ERROR_ALREADY_EXISTS
@@ -321,6 +321,13 @@ def is_temporary(path: str) -> bool:
     return "\\uv\\cache\\" in p or "\\appdata\\local\\temp\\" in p
 
 
+def is_store_python(prefix: str) -> bool:
+    """True for the Microsoft Store build of Python (pass ``sys.base_prefix``, which
+    stays the Store install folder inside a venv). Windows runs it with its writes under
+    %APPDATA% redirected into a private per-package folder."""
+    return "\\windowsapps\\pythonsoftwarefoundation.python" in prefix.lower().replace("/", "\\")
+
+
 def install(args) -> int:
     server = entry_point("argus-mcp")
     if is_temporary(server):
@@ -328,11 +335,19 @@ def install(args) -> int:
             f"argus-mcp is running from a temporary location ({server}), probably through uvx. AI tools "
             "registered to it would break when uv cleans its cache. Install Argus permanently first:\n"
             "  uv tool install argus-screens --managed-python --python 3.13\n"
+            "(no Python download allowed on this machine? See docs/enterprise-install.md for an installed-Python route)\n"
             "and then run `argus install` again."
         )
         if not args.dry_run:
             raise ArgusError(message)
         print(f"WARNING: {message}\n")
+    if is_store_python(sys.base_prefix):
+        print(
+            "WARNING: Argus is running on the Microsoft Store build of Python. Windows redirects that Python's "
+            "writes under AppData into a private folder, so the edits to Claude Desktop's and VS Code's config "
+            "files would not reach those apps. Reinstall Argus on a Python from python.org, winget or uv "
+            "(docs/enterprise-install.md), then run `argus install` again.\n"
+        )
     allow = args.trust  # default: each AI tool keeps asking before a capture
     print(f"Argus MCP server: {server}")
     failures = 0
@@ -372,6 +387,7 @@ def uninstall(args) -> int:
 
 def doctor(_args) -> int:
     from . import privacy, win32
+    from .cli import diagnostics
     from .config import settings
     from .desktop import snapshot
     from .snips import screenshots_dir
@@ -390,7 +406,10 @@ def doctor(_args) -> int:
         print(f"OCR: NOT available ({exc})")
     print(f"Captures: {privacy.pause_state().describe()}; data in {home()}")
     print(f"Snips folder: {screenshots_dir()}")
-    print(f"Tray app: {'running' if tray_running() else 'not running'}; startup shortcut: {'yes' if STARTUP_LINK.exists() else 'no'}")
+    print(f"Profile: {s.profile}" + (f" ({s.profile_reason})" if s.work and s.profile_reason else ""))
+    print(f"Tray startup shortcut: {'yes' if STARTUP_LINK.exists() else 'no (argus install adds it)'}")
+    for line in diagnostics(s):
+        print(line)
     for problem in s.problems:
         print(f"Config problem: {problem}")
     for client in CLIENTS:

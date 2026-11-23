@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import sys
 from pathlib import Path
 
 from . import __version__, win32  # noqa: F401  (win32 first: DPI awareness)
-from .desktop import ArgusError
+from . import gate
+from .desktop import ArgusError, Paused, PolicyChanged
 
 
 def _region(text: str) -> list[float]:
@@ -29,6 +31,26 @@ def _box(text: str) -> list[float]:
     if len(parts) != 4:
         raise argparse.ArgumentTypeError("use x1,y1,x2,y2")
     return [float(p) for p in parts]
+
+
+def _utc_date(text: str) -> str:
+    from datetime import datetime
+
+    try:
+        datetime.strptime(text.strip(), "%Y-%m-%d")
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a date; use YYYY-MM-DD (UTC)") from None
+    return text.strip()
+
+
+def _count(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        value = -1
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number of entries (0 = all)")
+    return value
 
 
 def _targets(p: argparse.ArgumentParser) -> None:
@@ -103,9 +125,28 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("pause", help="block all captures (from every AI tool)")
     p.add_argument("--minutes", type=float, help="resume automatically after this long")
     sub.add_parser("resume", help="allow captures again")
-    sub.add_parser("status", help="paused or not, paths, hotkeys")
+    sub.add_parser("status", help="paused or not, profile, approvals, audit, tray, config problems")
+    p = sub.add_parser("profile", help="show or switch the privacy profile (work = only allowed apps are visible)")
+    p.add_argument("name", nargs="?", choices=["personal", "work"])
+    p = sub.add_parser("allow", help="manage apps and title patterns visible in the work profile")
+    p.add_argument("action", nargs="?", choices=["add", "remove", "add-title", "remove-title"])
+    p.add_argument("values", nargs="*")
+    p.add_argument("--learn", action="store_true", help="choose from the apps that have windows open now")
+    p.add_argument("--browser", action="store_true", help="apply a title pattern to browser tabs")
     p = sub.add_parser("cleanup", help="delete captures older than the retention period")
     p.add_argument("--all", action="store_true", help="delete every saved capture and mark now")
+
+    since_help = "only entries on or after this UTC date (YYYY-MM-DD)"
+    p = sub.add_parser("audit", help="approval-gate audit log (times are UTC)")
+    p.add_argument("--since", type=_utc_date, help=since_help)
+    p.add_argument("-n", "--count", type=_count, default=20,
+                   help="show the newest N matching entries (default 20, 0 = all); applies with --since too")
+    asub = p.add_subparsers(dest="audit_action", required=False)
+    asub.add_parser("verify", help="check the tamper-evidence hash chain")
+    e = asub.add_parser("export", help="copy the audit log to a .jsonl file for compliance")
+    e.add_argument("-o", "--out", type=Path, required=True, help="output .jsonl file")
+    # SUPPRESS: `argus audit --since D export ...` keeps the date given before the subcommand.
+    e.add_argument("--since", type=_utc_date, default=argparse.SUPPRESS, help=since_help)
 
     sub.add_parser("tray", help="run the tray app (hotkeys) in this console")
     sub.add_parser("mcp", help="run the MCP server on stdio")
@@ -118,7 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("uninstall", help="remove Argus from your AI tools and Windows startup")
     p.add_argument("--purge", action="store_true", help="also delete ~/.argus (captures, marks, baselines, settings)")
-    sub.add_parser("doctor", help="check that everything works")
+    sub.add_parser("doctor", help="check monitors, OCR, approvals, audit, the tray and each registration")
     return ap
 
 
@@ -128,24 +169,32 @@ def _client_keys() -> list[str]:
     return [c.key for c in CLIENTS]
 
 
-def _emit(result, args, out: Path | None = None) -> None:
+def _result_text(result, args) -> tuple[str, ...]:
     from .service import caption
 
     caps = result.captures
+    parts = result.parts
+    if result.query:
+        parts = [f"Requested text: {result.query}", *parts]
     if getattr(args, "json", False):
         payload = {
-            "text": [p for p in result.parts if isinstance(p, str)],
+            "text": [p for p in parts if isinstance(p, str)],
             "captures": [
                 {"id": c.id, "label": c.shot.label, "path": str(c.path) if c.path else None,
                  "width": c.image.width, "height": c.image.height, "notes": c.shot.notes, "hidden": c.shot.hidden}
                 for c in caps
             ],
         }
-        print(json.dumps(payload, indent=2))
-    else:
-        for part in result.parts:
-            print(part if isinstance(part, str) else caption(part))
+        return (json.dumps(payload, indent=2),)
+    return tuple(part if isinstance(part, str) else caption(part) for part in parts)
+
+
+def _emit(result, args, out: Path | None = None) -> None:
+    for part in _result_text(result, args):
+        print(part)
+        if not getattr(args, "json", False):
             print()
+    caps = result.captures
     if out is not None and caps:
         if len(caps) == 1 and out.suffix:
             out.parent.mkdir(parents=True, exist_ok=True)
@@ -167,11 +216,24 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return _run(args) or 0
-    except ArgusError as exc:
+    except gate.GateStopped as exc:
         print(f"argus: {exc}", file=sys.stderr)
+        return 2
+    except ArgusError as exc:
+        from .errors import scrub
+
+        print(f"argus: {scrub(str(exc))}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         return 130
+    except Exception as exc:
+        from .errors import describe_unexpected
+
+        message = describe_unexpected(exc)
+        if message is None:
+            raise
+        print(f"argus: {message}", file=sys.stderr)
+        return 1
 
 
 def _run(args) -> int | None:
@@ -192,26 +254,81 @@ def _run(args) -> int | None:
         return getattr(install, cmd)(args)
     if cmd in ("pause", "resume", "status", "cleanup"):
         return _privacy_cmd(args)
+    if cmd == "audit":
+        return _audit_cmd(args)
+    if cmd == "profile":
+        return _profile_cmd(args)
+    if cmd == "allow":
+        return _allow_cmd(args)
 
-    from .service import Session
+    from .store import defer_captures
 
-    session = Session(track=False)
+    start = gate.policy()
+    tool = {"shot": "screenshot", "ocr": "read_text", "find": "find_text", "snip": "latest_snip",
+            "list": "list_screens", "wait": "wait_for"}.get(cmd, cmd)
+    if cmd == "baseline":
+        tool = {"save": "save_baseline", "compare": "compare"}.get(args.action, "baseline")
+    try:
+        with defer_captures():
+            return _capture_cmd(args, start, tool)
+    except ArgusError as exc:
+        from .errors import scrub
+
+        if isinstance(exc, PolicyChanged) or gate.policy_changed(start):
+            gate.require(gate.request(tool, start=start, interrupted=True, client="argus-cli"))
+        if start.profile == "work" and not isinstance(exc, Paused):
+            gate.require(gate.request(
+                tool, text=(scrub(str(exc)),), start=start, allow_trust=False, client="argus-cli",
+            ))
+        raise
+
+
+def _capture_cmd(args, start: gate.Policy, tool: str) -> int | None:
+    from .service import Result, Session, WatchApproval
+    from .store import publish_captures
+    from .text import display_arg
+
+    cmd = args.cmd
+    work = start.profile == "work"
+    gated = start.enabled  # work always; personal with [gate] enabled = true, as for MCP
+    session = Session(track=False, defer_marks=True)
+
+    def review(text, shots=(), *, result=None, required=True):
+        if gated or gate.policy_changed(start):
+            windows, _ = result.approval_scope() if result is not None else (None, False)
+            previews = []
+            for shot in shots:
+                # CLI paths and --out expose the full-resolution PNG.
+                with io.BytesIO() as buffer:
+                    shot.image.save(buffer, format="PNG")
+                    previews.append(buffer.getvalue())
+            gate.require(gate.request(
+                tool, tuple(previews), text, windows=windows, start=start, required=required,
+                allow_trust=False, client="argus-cli",
+            ))
+        if result is not None:
+            publish_captures(result.captures if gated else None)
+
+    def emit(result, out=None):
+        review(_result_text(result, args), (cap.shot for cap in result.captures), result=result)
+        _emit(result, args, out)
+
     if cmd == "look":
-        _emit(session.look("monitor" if args.monitor_scope else "window", args.grid or None, args.fresh), args, args.out)
+        emit(session.look("monitor" if args.monitor_scope else "window", args.grid or None, args.fresh), args.out)
     elif cmd == "shot":
-        _emit(session.screenshot(args.monitor, args.window, args.region, args.grid or None), args, args.out)
+        emit(session.screenshot(args.monitor, args.window, args.region, args.grid or None), args.out)
     elif cmd == "list":
         result = session.list_screens()
-        if args.json:
-            print(json.dumps(_list_json(session), indent=2))
-        else:
-            print(result.parts[0])
+        # Paused work inventory contains only a status message.
+        payload = json.dumps(_list_json(session), indent=2) if args.json and (result.screen_derived or not work) else result.parts[0]
+        review((payload,), result=result, required=result.screen_derived)
+        print(payload)
     elif cmd == "zoom":
         if not args.box:
             raise ArgusError("--box x1,y1,x2,y2 is required")
-        _emit(session.zoom(args.box, None, args.file), args, args.out)
+        emit(session.zoom(args.box, None, args.file), args.out)
     elif cmd == "snip":
-        _emit(session.latest_snip(args.count), args)
+        emit(session.latest_snip(args.count))
     elif cmd == "mark":
         from . import privacy
         from .capture import capture_monitor, capture_window
@@ -223,48 +340,184 @@ def _run(args) -> int | None:
         privacy.ensure_not_paused()
         desk = snapshot(NO_HOST)
         win = desk.window_under_cursor or desk.foreground_window
-        window_shot = capture_window(desk, win, s) if win else None
-        mark = save_mark(window_shot, capture_monitor(desk, desk.cursor_monitor, s))
-        print(f"Marked {win.label if win else desk.cursor_monitor.title} ({mark.id})")
+        window_shot, problem = None, ""
+        if win is not None:
+            try:
+                window_shot = capture_window(desk, win, s)
+            except ArgusError as exc:
+                problem = str(exc)
+        monitor_shot = capture_monitor(desk, desk.cursor_monitor, s)
+        what = privacy.display_name(win, s) if window_shot is not None and win else desk.cursor_monitor.title
+        note = f" - window not captured: {problem}" if problem else ""
+        shots = [shot for shot in (window_shot, monitor_shot) if shot is not None]
+        review((f"Marked {what}{note}",), shots, result=Result(evidence=shots))
+        mark = save_mark(window_shot, monitor_shot, extra={"problem": problem} if problem else None)
+        print(f"Marked {what} ({mark.id}){note}")
     elif cmd == "ocr":
         if args.file:
             result = asyncio.run(session.read_text(capture_id=args.file, positions=not args.plain))
         else:
             result = asyncio.run(session.read_text(args.monitor, args.window, args.region, positions=not args.plain))
-        print("\n\n".join(p for p in result.parts if isinstance(p, str)))
+        payload = "\n\n".join(p for p in result.parts if isinstance(p, str))
+        review((payload,), result=result)
+        print(payload)
     elif cmd == "find":
-        _emit(asyncio.run(session.find_text(args.text, args.monitor, args.window, args.region)), args)
+        emit(asyncio.run(session.find_text(args.text, args.monitor, args.window, args.region)))
     elif cmd == "baseline":
-        return _baseline(session, args)
+        return _baseline(session, args, work=work, review=review, emit=emit)
     elif cmd == "wait":
-        result = asyncio.run(session.wait_for(args.until, args.text, args.monitor, args.window, args.region, args.timeout))
-        _emit(result, args)
+        query = display_arg(args.text) if args.text and args.until in ("text", "text_gone") else ""
+        watch = WatchApproval(start, query, client="argus-cli", allow_trust=False)
+        result = asyncio.run(session.wait_for(
+            args.until, args.text, args.monitor, args.window, args.region, args.timeout,
+            approve_frame=watch.review_frame if gated else None,
+        ))
+        emit(result)
         first = next((p for p in result.parts if isinstance(p, str)), "")
         return 0 if first.startswith("Done") else 1
     return 0
 
 
-def _baseline(session, args) -> int:
+def _baseline(session, args, *, work, review, emit) -> int:
     from . import testing
 
     if args.action == "save":
-        print(session.save_baseline(args.name, args.monitor, args.window, args.region).parts[0])
+        result = session.save_baseline(args.name, args.monitor, args.window, args.region, local_receipt=work)
+        review(tuple(result.parts), result=result, required=not work)
+        print(result.parts[0])
     elif args.action == "compare":
         result = session.compare(baseline=args.name, show="both" if args.both else "after")
-        _emit(result, args)
+        emit(result)
         first = next((p for p in result.parts if isinstance(p, str)), "")
         return 0 if first.startswith("No visible change") else 1
     elif args.action == "list":
-        rows = testing.list_baselines()
-        if not rows:
-            print("No baselines yet.")
-        for name, path, taken, label in rows:
-            import time
+        import time
 
-            print(f"{name:24} {time.strftime('%Y-%m-%d %H:%M', time.localtime(taken))}  {label}  ({path})")
+        from .config import settings
+
+        s = settings()
+        # Work profile: baselines from the personal profile or an older policy
+        # are only counted - their names and labels may describe hidden things.
+        rows, hidden = testing.baselines(s if s.work else None)
+        lines = []
+        if not rows and not hidden:
+            lines.append("No baselines yet.")
+        for name, path, taken, label in rows:
+            lines.append(f"{name:24} {time.strftime('%Y-%m-%d %H:%M', time.localtime(taken))}  {label}  ({path})")
+        if hidden:
+            lines.append(f"{hidden} hidden baseline(s): not saved under the current work profile.")
+        review(tuple(lines), required=bool(rows))
+        print("\n".join(lines))
     elif args.action == "delete":
         print("Deleted." if testing.delete_baseline(args.name) else f"No baseline named {args.name!r}.")
     return 0
+
+
+_VERIFY_HINTS = (
+    ("truncat", "Entries are missing from the end of the log: audit/head.json records more entries than the files "
+                "hold (a crash, a restored backup or a deleted file). This catches accidental loss; it is not proof "
+                "against someone who can edit files as you."),
+    ("anchor", "The pruning record (audit/anchor.json) doesn't match the monthly files that are left, e.g. a month "
+               "was deleted or restored by hand."),
+    ("chain broken", "A line was changed, removed or inserted at that point, so it and every later entry are "
+                     "unverified."),
+    ("incomplete line", "A write was cut off (crash or power loss). Argus continues the chain after it, so this "
+                        "alone is not tampering."),
+)
+
+
+def _explain_verify(message: str) -> str:
+    """`argus audit verify`'s result plus a plain-language line per problem type."""
+    lower = message.lower()
+    hints = [hint for needle, hint in _VERIFY_HINTS if needle in lower]
+    return "\n".join([message, *(f"What this means: {hint}" for hint in hints)])
+
+
+def _audit_cmd(args) -> int:
+    from . import audit
+
+    action = getattr(args, "audit_action", None)
+    since = getattr(args, "since", None)
+    if action == "verify":
+        valid, message = audit.verify_chain()
+        text = _explain_verify(message)
+        if valid:
+            print(text)
+            return 0
+        print(f"argus audit: {text}", file=sys.stderr)
+        return 1
+    if action == "export":
+        out = args.out
+        try:
+            count = audit.export_log(
+                out, since=since, report_skipped=lambda n: print(f"Skipped {n} unparseable audit line(s)."),
+            )
+        except (OSError, ValueError) as exc:
+            print(f"argus audit: {exc}", file=sys.stderr)
+            return 1
+        print(f"Exported {count} audit entry(ies) to {out}")
+        return 0
+    entries = audit.read_entries(since=since, limit=None)
+    if args.count:
+        entries = entries[-args.count:]
+    print(audit.format_table(entries))
+    if entries:
+        print("Times are UTC.")
+    return 0
+
+
+# Shown when approvals are needed but the tray can't take them. gate.py's own
+# message to the AI stays short; this is the longer version for the user.
+APPROVAL_HELP = ("start or restart argus-tray; if you upgraded Argus, quit the old tray (tray menu > Quit Argus tray) "
+                 "and start the new one; if config.toml has problems, fix the ones `argus status` lists")
+
+
+def _pipe_state() -> str:
+    """'verified', 'unverified', 'missing', 'busy' or 'error' (see gate_pipe.probe)."""
+    try:
+        from .gate_pipe import probe
+
+        return probe()
+    except Exception:
+        return "error"
+
+
+_PIPE_TEXT = {
+    "verified": "reachable and verified (approvals will show)",
+    "unverified": "found, but its owner isn't a verified Argus tray from this install",
+    "missing": "not found",
+    "busy": "busy (every connection in use); try again",
+    "error": "couldn't be checked",
+}
+
+
+def diagnostics(s=None) -> list[str]:
+    """Approval gate, audit log, tray and config lines for `argus status` and `argus doctor`."""
+    from .config import home, settings
+    from .install import tray_running
+
+    s = s or settings()
+    if s.work:
+        gate = "on (the work profile always asks in the tray)"
+        audit = f"on (the work profile always logs), {home() / 'audit'}"
+    else:
+        gate = "on ([gate] enabled = true)" if s.gate_enabled else "off (personal; [gate] enabled = true turns it on)"
+        audit = (f"on ([audit] enabled = true), {home() / 'audit'}" if s.audit_enabled
+                 else "off (personal; [audit] enabled = true turns it on)")
+    try:
+        running = "yes" if tray_running() else "no"
+    except Exception:
+        running = "unknown"
+    pipe = _pipe_state()
+    lines = [
+        f"Approval gate: {gate}",
+        f"Audit log: {audit}",
+        f"Tray process running: {running}; approval pipe: {_PIPE_TEXT.get(pipe, pipe)}",
+    ]
+    if s.requires_approval and pipe != "verified":
+        lines.append(f"Approvals are UNAVAILABLE, so every capture is refused. To fix: {APPROVAL_HELP}.")
+    lines.append(f"Config problems: {len(s.problems)}" if s.problems else "Config problems: none")
+    return lines
 
 
 def _privacy_cmd(args) -> int:
@@ -280,6 +533,8 @@ def _privacy_cmd(args) -> int:
         print("Argus resumed.")
     elif args.cmd == "status":
         print(status_text())
+        for line in diagnostics():
+            print(line)
     elif args.cmd == "cleanup":
         if args.all:
             privacy.purge_all()
@@ -287,6 +542,180 @@ def _privacy_cmd(args) -> int:
         else:
             n = privacy.cleanup(settings(), force=True)
             print(f"Deleted {n} old file(s).")
+    return 0
+
+
+def _profile_cmd(args) -> int:
+    from . import config
+
+    if args.name:
+        try:
+            s = config.set_profile(args.name)
+        except ValueError as exc:
+            if config.settings().work and args.name.strip().lower() == "work":
+                raise ArgusError(f"{exc}. The work profile is on anyway: Argus remembers the switch.") from None
+            raise ArgusError(str(exc)) from None
+        print(f"Switched to the {s.profile} profile. It applies to the next capture.")
+    else:
+        s = config.settings()
+        print(f"Active profile: {s.profile}")
+    if s.work:
+        apps = ", ".join(sorted(s.allow_apps)) or "none"
+        if s.profile_reason:
+            print(f"Why work: {s.profile_reason}.")
+        print("Only allowed windows are visible; everything else is blacked out and titles are hidden.")
+        print(f"Allowed apps: {apps}")
+        print(f"Allowed browser-tab patterns: {', '.join(p.pattern for p in s.allow_browser_titles) or 'none'}")
+        if s.allow_titles:
+            print(f"Allowed title patterns: {', '.join(p.pattern for p in s.allow_titles)}")
+        if s.allow_browser_titles or s.allow_titles:
+            print("Note: title patterns match titles that pages/programs set themselves - a convenience, not a security "
+                  "boundary. For strict control, allow a dedicated browser by exe name instead.")
+        if s.lockdown:
+            print("Nothing is allowed until the config problem(s) below are fixed, so captures will be fully black.")
+        elif not (s.allow_apps or s.allow_browser_titles or s.allow_titles):
+            print("Nothing is allowed yet, so captures will be fully black. Run `argus allow --learn` to pick apps "
+                  f"from the ones you have open, or add them under [work] in {config.config_path()}.")
+    else:
+        print("Everything is visible except the [privacy] block list. `argus profile work` switches to the allow list.")
+    for problem in s.problems:
+        print(f"Config problem: {problem}")
+    return 0
+
+
+_LIST_LABELS = {
+    "allow_apps": "Allowed apps",
+    "allow_browser_titles": "Allowed browser-tab patterns",
+    "allow_titles": "Allowed title patterns",
+}
+
+
+def _refuse_if_problems(problems) -> None:
+    if problems:
+        for problem in problems:
+            print(f"Config problem: {problem}", file=sys.stderr)
+        raise ArgusError("config.toml has the problem(s) above, so `argus allow` won't edit it. Fix them first "
+                         "(`argus status` lists them too).")
+
+
+def _edit_allow_list(key: str, add=(), remove=()) -> tuple[list[str], list[str]]:
+    from . import config
+
+    try:
+        return config.edit_work_list(key, add=add, remove=remove)
+    except config.ConfigProblems as exc:
+        _refuse_if_problems(exc.problems)
+        raise
+    except ValueError as exc:
+        raise ArgusError(f"couldn't update the allow list: {exc}") from None
+
+
+def _allow_cmd(args) -> int:
+    from . import config
+
+    if args.learn:
+        if args.action or args.values or args.browser:
+            raise ArgusError("use `argus allow --learn` by itself")
+        return _allow_learn()
+    if not args.action:
+        return _allow_show()
+    _refuse_if_problems(config.settings().problems)  # checked again under the edit lock
+    if args.action in ("add", "remove"):
+        if args.browser:
+            raise ArgusError("--browser only applies to add-title and remove-title")
+        if not args.values:
+            raise ArgusError(f"give one or more program names ending in .exe, e.g. argus allow {args.action} Code.exe")
+        if args.action == "add" and any(not v.lower().endswith(".exe") for v in args.values):
+            raise ArgusError("program names must end in .exe (the process name, e.g. Code.exe)")
+        key = "allow_apps"
+    else:
+        if len(args.values) != 1:
+            raise ArgusError(f"{args.action} takes exactly one regex; quote it, e.g. argus {args.cmd} {args.action} '^Jira'")
+        key = "allow_browser_titles" if args.browser else "allow_titles"
+    adding = args.action.startswith("add")
+    before, after = _edit_allow_list(key, add=args.values if adding else (), remove=() if adding else args.values)
+    fold = str.lower if key == "allow_apps" else str
+    had = {fold(v) for v in before}
+    for value in args.values:
+        if adding and fold(value) in had:
+            print(f"{value} was already in the list.")
+        elif not adding and fold(value) not in had:
+            print(f"{value} wasn't in the list.")
+    if before != after:
+        print("Updated the work allow list.")
+    print(f"{_LIST_LABELS[key]}: {', '.join(after) or 'none'}")
+    if not config.settings().work:
+        print("Note: allow lists only apply in the work profile (argus profile work).")
+    return 0
+
+
+def _allow_show() -> int:
+    from . import config
+
+    s = config.settings()
+    raw = config.raw_work_lists()
+    for problem in s.problems:
+        print(f"Config problem: {problem}")
+    for key, label in _LIST_LABELS.items():
+        value = raw[key]
+        print(f"{label}: " + ("(can't be read: see the config problems)" if value is None else ", ".join(value) or "none"))
+    if s.lockdown:
+        print("These lists are NOT in effect: because of the config problem(s), the work profile allows nothing "
+              "until config.toml is fixed.")
+    elif not s.work:
+        print("These lists apply only in the work profile (argus profile work).")
+    return 0
+
+
+def _allow_learn() -> int:
+    from . import config
+    # Private names: desktop.py has no public "is this a shell surface" helper yet.
+    from .desktop import _SHELL_CLASSES, _SHELL_PROCESSES, NO_HOST, snapshot
+
+    _refuse_if_problems(config.settings().problems)
+    allowed = {v.lower() for v in config.raw_work_lists()["allow_apps"] or ()}
+    candidates: dict[str, tuple[str, str]] = {}
+    for w in snapshot(NO_HOST).windows:
+        exe = w.process.strip()
+        if (not w.is_app or not exe or not exe.lower().endswith(".exe") or not w.pid
+                or w.cls in _SHELL_CLASSES or exe.lower() in _SHELL_PROCESSES
+                or exe.lower() in {"argus.exe", "argus-tray.exe", "python.exe", "pythonw.exe"}):
+            continue
+        candidates.setdefault(exe.lower(), (w.app or exe, exe))
+    rows = sorted(candidates.values(), key=lambda x: x[0].casefold())
+    if not rows:
+        print("No eligible apps have windows open. Open the apps you want to allow, then run this again.")
+        return 0
+    print("Apps with windows open now (window titles are never shown):")
+    for i, (app, exe) in enumerate(rows, 1):
+        print(f"{i}. {app} - {exe}" + (" (allowed)" if exe.lower() in allowed else ""))
+    print("Enter numbers to allow, e.g. 1 3 5, or 'a' for all, blank to cancel")
+
+    def ask() -> str:
+        try:
+            return input("> ").strip().lower()
+        except EOFError:
+            return ""
+
+    choice = ask()
+    if not choice:
+        print("Cancelled.")
+        return 0
+    try:
+        picks = [int(n) for n in choice.replace(",", " ").split()] if choice != "a" else []
+    except ValueError:
+        raise ArgusError("enter valid numbers, or 'a'") from None
+    if any(not 1 <= n <= len(rows) for n in picks):
+        raise ArgusError(f"numbers must be between 1 and {len(rows)}")
+    selected = rows if choice == "a" else [rows[n - 1] for n in dict.fromkeys(picks)]
+    print("Allow " + ", ".join(exe for _, exe in selected) + "? [y/N]", flush=True)
+    if ask() not in {"y", "yes"}:
+        print("Cancelled.")
+        return 0
+    _, after = _edit_allow_list("allow_apps", add=[exe for _, exe in selected])
+    print(f"Updated allowed apps: {', '.join(after) or 'none'}")
+    if not config.settings().work:
+        print("Note: allow lists only apply in the work profile (argus profile work).")
     return 0
 
 
@@ -298,6 +727,8 @@ def _list_json(session) -> dict:
     desk = session.desk()
 
     def title(w) -> str:
+        if not privacy.allowed(w, s):
+            return "(hidden: work profile)"
         return "(hidden: privacy list)" if privacy.sensitive_reason(w, s) else w.title
 
     return {

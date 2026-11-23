@@ -5,14 +5,25 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  # The project used to pin this in pyproject.toml. That only ever affected `uv sync` /
+  # `uv run` in a checkout (never `uv tool install` from PyPI), so it now lives here:
+  # CI stays on a uv-managed Python while contributors may use a system one.
+  UV_PYTHON_PREFERENCE: only-managed
+
 jobs:
   test:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.2.0  # setup-uv publishes full version tags only
+        with:
+          version: ">=0.12,<0.13"  # `uv export` output is only stable within a uv minor version
       - name: Install
         run: uv sync --locked
+      - name: constraints/requirements-lock.txt matches uv.lock
+        # Fails when dependencies change without re-exporting. Fix: python scripts/export_constraints.py
+        run: uv run --no-project python scripts/export_constraints.py --check
       - name: Unit tests (fake desktops; live tests need a real one)
         run: uv run pytest -q
       - name: CLI smoke test

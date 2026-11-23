@@ -14,14 +14,18 @@ import threading
 import time
 import tkinter as tk
 from ctypes import wintypes
+from pathlib import Path
 
 import pystray
 from PIL import Image, ImageDraw
 
 from . import privacy, win32
 from .capture import capture_monitor, capture_window
-from .config import config_path, home, parse_hotkey, pretty_hotkey, settings
+from .config import config_path, home, parse_hotkey, pretty_hotkey, set_profile, settings, tray_mutex_name
 from .desktop import NO_HOST, ArgusError, set_host, snapshot
+from .errors import log_unexpected
+from .gate_pipe import PipeServer
+from .gate_ui import Approvals
 from .geometry import Rect
 from .marks import marks_dir, save_mark
 
@@ -84,6 +88,9 @@ class TrayApp:
         self.events: queue.Queue = queue.Queue()
         self.root = tk.Tk()
         self.root.withdraw()
+        self.approvals = Approvals(self.root)
+        self.pipe = PipeServer(self.approvals.answer)
+        self.pipe_ok = False
         s = settings()
         self.hotkeys = Hotkeys(self.events, {1: ("mark", s.hotkey_mark), 2: ("pause", s.hotkey_pause)})
         self.paused = privacy.pause_state().paused
@@ -95,7 +102,17 @@ class TrayApp:
     def _title(self) -> str:
         s = settings()
         state = privacy.pause_state().describe()
-        return f"Argus: {state}\nMark: {pretty_hotkey(s.hotkey_mark)} | Pause: {pretty_hotkey(s.hotkey_pause)}"
+        title = (
+            f"Argus: {state}, {s.profile} profile\n"
+            f"Mark: {pretty_hotkey(s.hotkey_mark)} | Pause: {pretty_hotkey(s.hotkey_pause)}"
+        )
+        if s.work and s.configured != "work":
+            title += "\nWork kept on" + (" with nothing allowed" if s.lockdown else "") + ": see `argus status`"
+        if not self.pipe_ok:
+            title += "\nApprovals unavailable: see `argus status`"
+        if s.problems:
+            title += f"\nConfig problem ({len(s.problems)}): see `argus status`"
+        return title[:127]  # the notification-area tooltip limit
 
     def _menu(self) -> pystray.Menu:
         s = settings()
@@ -106,8 +123,28 @@ class TrayApp:
             pystray.MenuItem("Pause captures", lambda: post(("pause", None)), checked=lambda _i: self.paused),
             pystray.MenuItem("Pause for 15 minutes", lambda: post(("pause15", None)), enabled=lambda _i: not self.paused),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                lambda _i: f"Profile: {settings().profile.capitalize()}",
+                pystray.Menu(
+                    pystray.MenuItem(
+                        "Personal (hide only the privacy list)",
+                        lambda: post(("profile", "personal")),
+                        checked=lambda _i: not settings().work,
+                        radio=True,
+                    ),
+                    pystray.MenuItem(
+                        "Work (show only allowed apps)",
+                        lambda: post(("profile", "work")),
+                        checked=lambda _i: settings().work,
+                        radio=True,
+                    ),
+                ),
+            ),
+            pystray.MenuItem("Revoke trust", lambda: post(("revoke", None))),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Open captures folder", lambda: post(("open", home() / "captures"))),
             pystray.MenuItem("Open marks folder", lambda: post(("open", marks_dir()))),
+            pystray.MenuItem("Open audit log folder", lambda: post(("open", home() / "audit"))),
             pystray.MenuItem("Edit settings", lambda: post(("open", config_path()))),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit Argus tray", lambda: post(("quit", None))),
@@ -124,12 +161,34 @@ class TrayApp:
     # -- loop ----------------------------------------------------------------------
 
     def run(self) -> None:
+        try:
+            self.pipe.start()
+            self.pipe_ok = True
+        except OSError:
+            log.warning("Could not start the Argus approval pipe")
         self.hotkeys.start()
+        self.icon.title = self._title()
         self.icon.run_detached()
+        if not self.pipe_ok:
+            self.root.after(1500, self._pipe_failed)
         self.root.after(50, self._poll)
         self.root.after(1000, self._tick)
         log.info("tray started")
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            self.approvals.close()
+            self.pipe.close()
+
+    def _pipe_failed(self) -> None:
+        """Approvals can't reach this tray, so every capture that needs one is refused."""
+        message = ("Argus can't show approval prompts, so captures that need approval are refused. "
+                   "Quit any other Argus tray (e.g. an old version), then restart argus-tray. See `argus status`.")
+        try:
+            self.icon.notify(message, "Argus approvals unavailable")
+        except Exception as exc:
+            log_unexpected(log, exc, "notify")
+        self.pill("Argus approvals unavailable: see argus status", WARN, ms=4000)
 
     def _poll(self) -> None:
         try:
@@ -138,6 +197,7 @@ class TrayApp:
                 self._handle(action, arg)
         except queue.Empty:
             pass
+        self.approvals.poll()
         self.root.after(50, self._poll)
 
     def _tick(self) -> None:
@@ -146,8 +206,8 @@ class TrayApp:
             if time.time() - self._last_cleanup > 3600:
                 self._last_cleanup = time.time()
                 privacy.cleanup(settings(), force=True)
-        except Exception:
-            log.exception("tick failed")
+        except Exception as exc:
+            log_unexpected(log, exc, "tick")
         self.root.after(1000, self._tick)
 
     def _handle(self, action: str, arg) -> None:
@@ -160,7 +220,13 @@ class TrayApp:
                 privacy.pause(15)
                 self._refresh()
                 self.pill("Argus paused for 15 minutes: AI tools can't see your screens", WARN)
+            elif action == "profile":
+                self.switch_profile(arg)
+            elif action == "revoke":
+                self.approvals.trust.revoke()
             elif action == "open":
+                if isinstance(arg, Path) and not arg.suffix:
+                    arg.mkdir(parents=True, exist_ok=True)
                 os.startfile(arg)  # noqa: S606 - opening our own folders/files
             elif action == "hotkeys" and arg:
                 self.pill("Argus couldn't register: " + "; ".join(arg), WARN, ms=4000)
@@ -169,8 +235,8 @@ class TrayApp:
                 self.hotkeys.stop()
                 self.icon.stop()
                 self.root.quit()
-        except Exception:
-            log.exception("action %s failed", action)
+        except Exception as exc:
+            log_unexpected(log, exc, f"action {action}")  # work profile: type + error id only
             self.pill(f"Argus: {action} failed (see logs)", WARN)
 
     # -- actions -------------------------------------------------------------------
@@ -193,11 +259,31 @@ class TrayApp:
         save_mark(window_shot, monitor_shot, extra={"problem": problem} if problem else None)
         if window_shot is not None and win is not None:
             self.flash(win.rect, f"Marked for Argus: {win.app or win.process}")
+        elif problem and win is not None and not privacy.allowed(win, s):
+            self.flash(mon.rect, f"Marked {mon.title} - that window isn't allowed by your work profile", colour=WARN)
         elif problem:
             self.flash(mon.rect, f"Marked {mon.title} - that window is on your privacy list", colour=WARN)
         else:
             self.flash(mon.rect, f"Marked {mon.title}")
-        log.info("mark: %s", win.label if window_shot and win else mon.title)
+        log.info("mark: %s", privacy.display_name(win, s) if window_shot and win else mon.title)
+
+    def switch_profile(self, name: str) -> None:
+        try:
+            s = set_profile(name)
+        except ValueError as exc:
+            log.warning("profile switch failed: %s", exc)
+            if name == "work" and settings().work:  # the switch is remembered even so
+                self._refresh()
+                self.pill("Argus work profile is on, but config.toml couldn't be updated: see argus status", ACCENT, ms=3000)
+            else:
+                self.pill("Argus couldn't switch profile: fix config.toml first", WARN, ms=3000)
+            return
+        self._refresh()
+        if s.work:
+            self.pill("Argus work profile: AI tools see only the apps you allowed", ACCENT, ms=2200)
+        else:
+            self.pill("Argus personal profile: everything but your privacy list is visible", WARN, ms=2200)
+        log.info("profile: %s", s.profile)
 
     def toggle_pause(self) -> None:
         if privacy.pause_state().paused:
@@ -258,7 +344,7 @@ def _setup_logging() -> None:
 
 def main() -> None:
     _setup_logging()
-    lock = win32.single_instance("Local\\ArgusTray")
+    lock = win32.single_instance(tray_mutex_name())
     if lock is None:
         log.info("tray already running; exiting")
         return

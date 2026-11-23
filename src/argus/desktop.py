@@ -9,7 +9,8 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass, replace
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from pathlib import PurePath
 
 import psutil
@@ -17,6 +18,7 @@ from PIL import Image, ImageDraw
 
 from . import win32
 from .geometry import Rect, bounding
+from .text import display_arg
 from .layout import arrange
 
 
@@ -26,6 +28,10 @@ class ArgusError(Exception):
 
 class Paused(ArgusError):
     """The user has paused Argus; nothing may be captured."""
+
+
+class PolicyChanged(ArgusError):
+    """The privacy profile or its lists changed during a multi-frame call."""
 
 
 # ----------------------------------------------------------------- monitors
@@ -102,6 +108,33 @@ class Window:
     owner: int
     monitor: int | None  # display number holding most of the window
     host: bool = False  # the terminal/IDE this AI session runs in
+    alpha: int | None = None  # constant alpha of a layered window (LWA_ALPHA), None if it has none
+    rect_exact: bool = True  # False when the frame rect came from a fallback (may include borders)
+    app_pid: int = 0  # the hosted app's process for UWP frames (ApplicationFrameHost), else 0
+    attributed: bool = True  # False when the owning app couldn't be identified unambiguously
+    layered: bool = False  # WS_EX_LAYERED: may be translucent or per-pixel alpha
+    colorkey: bool = False  # a layered window that keys out one colour (see-through holes)
+    # Every owner up the chain, nearest first: (HWND, PID), invisible owners
+    # included. Empty means "only *owner* is known" (hand-made windows).
+    owner_chain: tuple[tuple[int, int], ...] = ()
+    region: tuple[int, Rect, bool] | None = None  # region type, bounds, covers full window
+
+    @property
+    def app_process_id(self) -> int:
+        """The process the window's content belongs to (the UWP app, not its frame host)."""
+        return self.app_pid or self.pid
+
+    @property
+    def transparent(self) -> bool:
+        """Provably invisible: a layered window with constant alpha 0."""
+        return self.alpha == 0
+
+    @property
+    def opaque(self) -> bool:
+        """Whether the region fills the window and its pixels are provably opaque."""
+        return (self.region is None or self.region[2]) and (
+            not self.layered or (self.alpha == 255 and not self.colorkey)
+        )
 
     @property
     def handle(self) -> str:
@@ -202,46 +235,61 @@ def set_host(host: Host) -> None:
 
 NO_HOST = Host(frozenset(), (), frozenset())
 
-# pid -> (time cached, exe name, exe path)
-_proc_cache: dict[int, tuple[float, str, str]] = {}
+# (pid, process start time) -> (time cached, exe name, exe path). Keyed by the
+# start time too, so a PID Windows reuses for another program is never mistaken
+# for the old one (the work profile allows windows by exe name).
+_proc_cache: dict[tuple[int, float], tuple[float, str, str]] = {}
 
 
 def _process(pid: int) -> tuple[str, str]:
-    hit = _proc_cache.get(pid)
+    """(exe name, exe path); ("", "") when the process can't be read (gone,
+    protected or elevated beyond reach) - the work profile never allows those."""
+    try:
+        p = psutil.Process(pid)
+        key = (pid, p.create_time())
+    except psutil.Error:
+        return "", ""
+    hit = _proc_cache.get(key)
     now = time.monotonic()
     if hit and now - hit[0] < 120:
         return hit[1], hit[2]
     name, exe = "", ""
     try:
-        p = psutil.Process(pid)
         name = p.name()
         try:
             exe = p.exe()
         except psutil.Error:
             exe = ""
     except psutil.Error:
-        pass
-    _proc_cache[pid] = (now, name, exe)
+        return "", ""
+    if len(_proc_cache) > 2048:
+        _proc_cache.clear()
+    _proc_cache[key] = (now, name, exe)
     return name, exe
 
 
-def _friendly_app(hwnd: int, pid: int, process: str, exe: str) -> tuple[str, str, int]:
-    """(process, app name, pid) - looking through ApplicationFrameHost to the real UWP app."""
+def _friendly_app(hwnd: int, pid: int, process: str, exe: str) -> tuple[str, str, int, bool]:
+    """(process, app name, pid, attributed) - looking through ApplicationFrameHost
+    to the real UWP app. *attributed* is False when a frame host's app can't be
+    pinned to exactly one process (the work profile then never allows it)."""
+    attributed = True
     if process.lower() == "applicationframehost.exe":
+        hosted = {}
         for child in win32.child_windows(hwnd):
             cpid = win32.window_pid(child)
-            if cpid and cpid != pid:
-                cname, cexe = _process(cpid)
-                if cname:
-                    process, exe, pid = cname, cexe, cpid
-                    break
+            if cpid and cpid != pid and cpid not in hosted:
+                hosted[cpid] = _process(cpid)
+        named = [(cpid, name, path) for cpid, (name, path) in hosted.items() if name]
+        attributed = len(hosted) == 1 and len(named) == 1
+        if named:  # the personal profile's block list still uses the first match
+            pid, process, exe = named[0]
     app = win32.file_description(exe) if exe else ""
     if process.lower() == "explorer.exe":
         app = "File Explorer"
     elif not app or app.lower() == "application frame host":
         app = PurePath(process).stem
     app = _APP_RENAMES.get(app, app)
-    return process, app, pid
+    return process, app, pid, attributed
 
 
 # File descriptions that read oddly as app names.
@@ -260,6 +308,9 @@ class Desktop:
     under_cursor: int
     host: Host
     taken: float
+    # Takes a new snapshot of the same desktop (the work profile checks that
+    # nothing moved while the pixels were grabbed). None for hand-made desktops.
+    refresh: Callable[[], Desktop] | None = field(default=None, compare=False, repr=False)
 
     @property
     def windows(self) -> list[Window]:
@@ -374,10 +425,12 @@ def snapshot(host: Host | None = None) -> Desktop:
 
     layers = []
     for z, h in enumerate(win32.top_level_windows()):
+        if win32.GetPropW(h, win32.APPROVAL_PREVIEW):
+            continue  # never list or PrintWindow an in-progress Argus approval
         if not win32.IsWindowVisible(h) or win32.is_cloaked(h):
             continue
         minimized = bool(win32.IsIconic(h))
-        rect = win32.frame_rect(h)
+        rect, exact = win32.frame_rect_ex(h)
         if rect.empty and not minimized:
             continue
         ex = win32.ex_style(h)
@@ -385,9 +438,11 @@ def snapshot(host: Host | None = None) -> Desktop:
         cls = win32.class_name(h)
         pid = win32.window_pid(h)
         process, exe = _process(pid)
-        alpha = win32.layered_alpha(h) if ex & win32.WS_EX_LAYERED else None
+        layered = bool(ex & win32.WS_EX_LAYERED)
+        alpha, colorkey = win32.layered_attributes(h) if layered else (None, False)
         see_through = bool(ex & win32.WS_EX_TRANSPARENT) or alpha == 0
         own = win32.owner(h)
+        chain = _owner_chain(own)
         is_app = (
             not see_through
             and cls not in _SHELL_CLASSES
@@ -397,17 +452,41 @@ def snapshot(host: Host | None = None) -> Desktop:
             and not (ex & win32.WS_EX_TOOLWINDOW and not ex & win32.WS_EX_APPWINDOW)
             and not (ex & win32.WS_EX_NOACTIVATE and not ex & win32.WS_EX_APPWINDOW)
         )
-        app = ""
+        app, app_pid, attributed = "", 0, True
         if is_app:
-            process, app, _app_pid = _friendly_app(h, pid, process, exe)
+            process, app, resolved, attributed = _friendly_app(h, pid, process, exe)
+            app_pid = resolved if resolved != pid else 0
+        elif process.lower() == "applicationframehost.exe":
+            attributed = False  # a frame host's popups can't be tied to one app
         mon = None if minimized else _monitor_for(monitors, rect)
         w = Window(
             hwnd=h, title=title, cls=cls, pid=pid, process=process, app=app, rect=rect, z=z,
             minimized=minimized, maximized=bool(win32.IsZoomed(h)), topmost=bool(ex & win32.WS_EX_TOPMOST),
             see_through=see_through, is_app=is_app, owner=own, monitor=mon,
+            alpha=alpha, rect_exact=exact, app_pid=app_pid, attributed=attributed,
+            layered=layered, colorkey=colorkey, owner_chain=chain, region=win32.window_region(h, rect),
         )
         layers.append(_with_host(w, host))
-    return Desktop(tuple(monitors), tuple(layers), cursor, fg, under, host, time.time())
+    return Desktop(tuple(monitors), tuple(layers), cursor, fg, under, host, time.time(), refresh=lambda: snapshot(host))
+
+
+OWNER_CHAIN_LIMIT = 16
+
+
+def _owner_chain(first: int) -> tuple[tuple[int, int], ...]:
+    """(HWND, PID) of *first* and every owner above it. A chain that loops or is
+    too deep ends with (0, 0), which no check accepts."""
+    chain: list[tuple[int, int]] = []
+    seen: set[int] = set()
+    h = first
+    while h:
+        if h in seen or len(chain) >= OWNER_CHAIN_LIMIT:
+            chain.append((0, 0))
+            break
+        seen.add(h)
+        chain.append((h, win32.window_pid(h)))
+        h = win32.owner(h)
+    return tuple(chain)
 
 
 def _monitor_for(monitors: list[Monitor], rect: Rect) -> int | None:
@@ -445,7 +524,7 @@ def find_monitors(desk: Desktop, spec: str | int) -> list[Monitor]:
         mon = desk.monitor(int(m.group(1)))
         if mon:
             return [mon]
-        raise ArgusError(f"There is no monitor {m.group(1)}. {_monitor_options(desk)}")
+        raise ArgusError(f"There is no monitor {display_arg(m.group(1))}. {_monitor_options(desk)}")
     text = re.sub(r"^the\s+", "", text)
     text = re.sub(r"^(monitor|screen|display)\s+", "", text)
     text = re.sub(r"\s+(monitor|screen|display)$", "", text)
@@ -489,7 +568,7 @@ def find_monitors(desk: Desktop, spec: str | int) -> list[Monitor]:
             return partial
         if len(partial) > 1:
             names = ", ".join(f'"{m.position}" ({m.title})' for m in partial)
-            raise ArgusError(f'"{spec}" matches several monitors: {names}. Pick one.')
+            raise ArgusError(f'"{display_arg(str(spec))}" matches several monitors: {names}. Pick one.')
         if len(desk.monitors) == 1:
             return list(desk.monitors)
     device = [m for m in desk.monitors if m.device.lower().lstrip("\\.").endswith(text.lstrip("\\."))]
@@ -499,8 +578,8 @@ def find_monitors(desk: Desktop, spec: str | int) -> list[Monitor]:
     if len(named) == 1:
         return named
     if len(named) > 1:
-        raise ArgusError(f'"{spec}" matches several monitors. {_monitor_options(desk)}')
-    raise ArgusError(f'No monitor matches "{spec}". {_monitor_options(desk)}')
+        raise ArgusError(f'"{display_arg(str(spec))}" matches several monitors. {_monitor_options(desk)}')
+    raise ArgusError(f'No monitor matches "{display_arg(str(spec))}". {_monitor_options(desk)}')
 
 
 def _monitor_options(desk: Desktop) -> str:
@@ -508,8 +587,17 @@ def _monitor_options(desk: Desktop) -> str:
     return f"Monitors: {opts}. Also: all, primary, cursor, active" + (", laptop." if any(m.builtin for m in desk.monitors) else ".")
 
 
-def find_windows(desk: Desktop, spec: str | int) -> list[Window]:
-    """Windows matching a selector, best match first."""
+def find_windows(
+    desk: Desktop,
+    spec: str | int,
+    *,
+    name: Callable[[Window], str] | None = None,
+    titled: Callable[[Window], bool] | None = None,
+) -> list[Window]:
+    """Windows matching a selector, best match first. *name* is how windows are
+    named in error messages (default: their label); windows for which *titled*
+    is False are matched by app, exe and handle only, never by title, so a
+    selector can't be used to probe a hidden window's title."""
     text = str(spec).strip()
     low = text.lower()
     if low in ("active", "focused", "foreground", "current"):
@@ -526,17 +614,18 @@ def find_windows(desk: Desktop, spec: str | int) -> list[Window]:
         w = desk.window(int(text, 0))
         if w:
             return [w]
-        raise ArgusError(f"No visible window has handle {text} (it may have closed). Call list_screens for current handles.")
+        raise ArgusError(f"No visible window has handle {display_arg(text)} (it may have closed). Call list_screens for current handles.")
 
     low = _APP_NICKNAMES.get(low, low)
     words = [t for t in re.split(r"\W+", low) if t]
     scored: list[tuple[float, Window]] = []
     for w in desk.windows:
-        title, app, proc = w.title.lower(), w.app.lower(), PurePath(w.process.lower()).stem
+        title = w.title.lower() if titled is None or titled(w) else ""
+        app, proc = w.app.lower(), PurePath(w.process.lower()).stem
         haystack = f"{title} {app} {proc}"
-        if title == low:
+        if title and title == low:
             score = 100.0
-        elif low and low in title:
+        elif low and title and low in title:
             score = 85.0
         elif low and (low in app or proc == low or proc.startswith(low)):
             score = 75.0
@@ -554,7 +643,7 @@ def find_windows(desk: Desktop, spec: str | int) -> list[Window]:
             scored.append((score, w))
     scored.sort(key=lambda sw: (-sw[0], sw[1].z))
     if not scored:
-        raise ArgusError(f'No window matches "{text}". Open windows: {_window_options(desk)}')
+        raise ArgusError(f'No window matches "{display_arg(text)}". Open windows: {_window_options(desk, name=name)}')
     return [w for _, w in scored]
 
 
@@ -565,6 +654,6 @@ _APP_NICKNAMES = {
 }
 
 
-def _window_options(desk: Desktop, limit: int = 12) -> str:
+def _window_options(desk: Desktop, limit: int = 12, name: Callable[[Window], str] | None = None) -> str:
     wins = [w for w in desk.windows if not w.host][:limit]
-    return "; ".join(f"{w.label} [{w.handle}]" for w in wins) or "none"
+    return "; ".join(f"{name(w) if name else w.label} [{w.handle}]" for w in wins) or "none"

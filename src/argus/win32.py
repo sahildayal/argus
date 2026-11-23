@@ -198,6 +198,7 @@ WS_CHILD = 0x40000000
 
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
+LWA_COLORKEY = 0x1
 LWA_ALPHA = 0x2
 PW_RENDERFULLCONTENT = 0x2
 MONITOR_DEFAULTTONEAREST = 2
@@ -234,10 +235,18 @@ GetWindowLongW = _fn(user32, "GetWindowLongW", wintypes.LONG, HWND, ctypes.c_int
 SetWindowLongW = _fn(user32, "SetWindowLongW", wintypes.LONG, HWND, ctypes.c_int, wintypes.LONG)
 GetWindow = _fn(user32, "GetWindow", HWND, HWND, wintypes.UINT)
 GetAncestor = _fn(user32, "GetAncestor", HWND, HWND, wintypes.UINT)
+GetPropW = _fn(user32, "GetPropW", wintypes.HANDLE, HWND, wintypes.LPCWSTR)
+SetPropW = _fn(user32, "SetPropW", wintypes.BOOL, HWND, wintypes.LPCWSTR, wintypes.HANDLE)
+SetWindowDisplayAffinity = _fn(user32, "SetWindowDisplayAffinity", wintypes.BOOL, HWND, wintypes.DWORD)
+SetWindowPos = _fn(user32, "SetWindowPos", wintypes.BOOL, HWND, HWND, ctypes.c_int, ctypes.c_int,
+                   ctypes.c_int, ctypes.c_int, wintypes.UINT)
+APPROVAL_PREVIEW = "Argus.ApprovalPreview"
 GetForegroundWindow = _fn(user32, "GetForegroundWindow", HWND)
 WindowFromPoint = _fn(user32, "WindowFromPoint", HWND, POINT)
 GetCursorPos = _fn(user32, "GetCursorPos", wintypes.BOOL, ctypes.POINTER(POINT))
 GetWindowRect = _fn(user32, "GetWindowRect", wintypes.BOOL, HWND, ctypes.POINTER(RECT))
+GetWindowRgnBox = _fn(user32, "GetWindowRgnBox", ctypes.c_int, HWND, ctypes.POINTER(RECT))
+GetDriveTypeW = _fn(kernel32, "GetDriveTypeW", wintypes.UINT, wintypes.LPCWSTR)
 GetLayeredWindowAttributes = _fn(
     user32,
     "GetLayeredWindowAttributes",
@@ -374,20 +383,58 @@ def window_rect(hwnd: int) -> Rect:
     return r.to_rect()
 
 
+def window_region(hwnd: int, frame: Rect) -> tuple[int, Rect, bool] | None:
+    """Region type, bounds in window coordinates, and whether it covers the whole window."""
+    bounds = RECT()
+    ctypes.set_last_error(0)
+    kind = GetWindowRgnBox(hwnd, ctypes.byref(bounds))
+    # ERROR with no last error is also how Windows reports a default region.
+    if not kind and not ctypes.get_last_error():
+        return None
+    box = bounds.to_rect()
+    full = window_rect(hwnd) if kind == 2 else None  # SIMPLEREGION
+    covers_frame = bool(full and full.intersect(frame) == frame and box == Rect(0, 0, full.w, full.h))
+    return kind, box, covers_frame
+
+
 def frame_rect(hwnd: int) -> Rect:
     """The visible frame, without the invisible resize borders Windows 10/11 add."""
+    return frame_rect_ex(hwnd)[0]
+
+
+def frame_rect_ex(hwnd: int) -> tuple[Rect, bool]:
+    """(frame rect, exact). Not exact when DWM couldn't say and the plain window
+    rect (which includes invisible borders) had to stand in."""
     r = RECT()
     if DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(r), ctypes.sizeof(r)) == 0:
-        return r.to_rect()
-    return window_rect(hwnd)
+        return r.to_rect(), True
+    return window_rect(hwnd), False
+
+
+PHYSICAL_DPI_MODES = ("per-monitor-v2", "per-monitor")
+
+
+def dpi_ok() -> bool:
+    """Are the coordinates Argus reads physical pixels (per-monitor DPI aware)?
+    If not, window rects are scaled by Windows and can't be trusted for redaction."""
+    return DPI_AWARENESS in PHYSICAL_DPI_MODES
 
 
 def layered_alpha(hwnd: int) -> int | None:
     """Constant alpha of a layered window, or None if it doesn't use one."""
+    return layered_attributes(hwnd)[0]
+
+
+def layered_attributes(hwnd: int) -> tuple[int | None, bool]:
+    """(constant alpha or None, uses a colour key) of a layered window.
+
+    GetLayeredWindowAttributes fails for windows drawn with UpdateLayeredWindow
+    (per-pixel alpha): those come back as (None, False), i.e. no evidence of
+    opacity at all."""
     alpha, flags = wintypes.BYTE(), wintypes.DWORD()
-    if GetLayeredWindowAttributes(hwnd, None, ctypes.byref(alpha), ctypes.byref(flags)) and flags.value & LWA_ALPHA:
-        return alpha.value & 0xFF
-    return None
+    if not GetLayeredWindowAttributes(hwnd, None, ctypes.byref(alpha), ctypes.byref(flags)):
+        return None, False
+    return (alpha.value & 0xFF if flags.value & LWA_ALPHA else None), bool(flags.value & LWA_COLORKEY)
 
 
 def cursor_pos() -> tuple[int, int]:

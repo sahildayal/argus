@@ -14,7 +14,8 @@ from pathlib import Path
 
 from .capture import Shot
 from .config import home
-from .store import meta, open_file, write_png
+from .errors import work_profile
+from .store import meta, open_file, work_replay_path, write_png
 
 
 def marks_dir() -> Path:
@@ -33,7 +34,11 @@ class Mark:
 
     def shot(self, scope: str = "window") -> Shot | None:
         path = self.monitor_png if scope == "monitor" else (self.window_png or self.monitor_png)
-        if path is None or not path.exists():
+        if path is None:
+            return None
+        if work_profile():
+            path = work_replay_path(path)
+        if not path.exists():
             return None
         shot = open_file(path)
         shot.kind = "mark"

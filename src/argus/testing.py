@@ -3,7 +3,6 @@ for the screen to change, settle, or show some text."""
 
 from __future__ import annotations
 
-import json
 import math
 import re
 import time
@@ -12,13 +11,16 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, PngImagePlugin
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 from .capture import Shot
 from .config import home
-from .desktop import ArgusError, Paused
+from .config import Settings
+from .desktop import ArgusError, Paused, PolicyChanged
 from .geometry import Rect
-from .store import meta, open_file
+from .errors import work_profile
+from .store import meta, open_file, png_info, replayable, work_replay_path
+from .text import display_arg
 
 # ---------------------------------------------------------------------- diff
 
@@ -141,31 +143,45 @@ def save_baseline(name: str, shot: Shot) -> Path:
     if not shot.target:
         raise ArgusError("Only monitor, window or region captures can be baselines (they get re-captured to compare).")
     path = _baseline_path(name)
-    info = PngImagePlugin.PngInfo()
-    info.add_text("argus", json.dumps({**meta(shot), "baseline": name}))
+    info = png_info(shot.image, {**meta(shot), "baseline": name})
     shot.image.save(path, format="PNG", compress_level=6, pnginfo=info)
     return path
 
 
-def load_baseline(name: str) -> Shot:
+def load_baseline(name: str, s: Settings | None = None) -> Shot:
     path = _baseline_path(name)
+    work = s.work if s is not None else work_profile()
+    if work:
+        path = work_replay_path(path)
     if not path.exists():
-        names = ", ".join(n for n, *_ in list_baselines()) or "none yet"
-        raise ArgusError(f"No baseline named {name!r}. Saved baselines: {names}.")
-    shot = open_file(path)
+        rows, hidden = baselines(s)
+        names = ", ".join(n for n, *_ in rows) or "none yet"
+        more = f" ({hidden} more hidden: not saved under the current work profile)" if hidden else ""
+        raise ArgusError(f"No baseline named {display_arg(name)!r}. Saved baselines: {names}{more}.")
+    shot = open_file(path, work=work)
     shot.kind = "baseline"
     return shot
 
 
 def list_baselines() -> list[tuple[str, Path, float, str]]:
-    out = []
+    return baselines()[0]
+
+
+def baselines(s: Settings | None = None) -> tuple[list[tuple[str, Path, float, str]], int]:
+    """(name, path, taken, label) of each baseline, and how many were left out:
+    in the work profile, those not saved under its current policy - their
+    names and labels could describe what the profile now hides."""
+    out, hidden = [], 0
     for p in sorted(baselines_dir().glob("*.png")):
         try:
             shot = open_file(p)
-            out.append((p.stem, p, shot.taken, shot.label))
         except ArgusError:
             continue
-    return out
+        if s is not None and not replayable(shot, s):
+            hidden += 1
+            continue
+        out.append((p.stem, p, shot.taken, shot.label))
+    return out, hidden
 
 
 def delete_baseline(name: str) -> bool:
@@ -202,6 +218,7 @@ async def wait_for(
     quiet: float = 1.5,
     sleep: Callable[[float], Awaitable[None]] | None = None,
     progress: Callable[[float, str], Awaitable[None]] | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> WaitResult:
     """Poll *grab* until the condition holds or *timeout* passes.
 
@@ -215,13 +232,15 @@ async def wait_for(
         raise ArgusError(f'until="{until}" needs the text to look for.')
     if until not in ("change", "stable", "text", "text_gone"):
         raise ArgusError('until must be "change", "stable", "text" or "text_gone".')
-    start = time.monotonic()
+    start = clock()
 
     def elapsed() -> float:
-        return time.monotonic() - start
+        return clock() - start
 
     try:
         first = await grab()
+    except PolicyChanged:
+        raise
     except ArgusError as exc:
         raise ArgusError(f"Can't start waiting: {exc}") from None
     last = first
@@ -234,17 +253,17 @@ async def wait_for(
             lines = await read(last.image)  # type: ignore[misc]
             hits = find(lines, text)  # type: ignore[misc]
             if until == "text" and hits:
-                return WaitResult(True, last, elapsed(), f'"{text}" appeared', matches=hits)
+                return WaitResult(True, last, elapsed(), "the requested text appeared", matches=hits)
             if until == "text_gone" and not hits:
-                return WaitResult(True, last, elapsed(), f'"{text}" is no longer on screen')
+                return WaitResult(True, last, elapsed(), "the requested text is no longer on screen")
         elif until == "change" and polls:
             d = diff(first.image, last.image)
             if d.changed >= min_change:
-                last = await _settle(grab, last, sleep, min_change)
+                last = await _settle(grab, last, sleep, min_change, clock)
                 return WaitResult(True, last, elapsed(), f"the screen changed ({diff(first.image, last.image).percent} of pixels)", diff(first.image, last.image))
         elif until == "stable" and polls:
             d = diff(previous.image, last.image)
-            now = time.monotonic()
+            now = clock()
             if d.changed < min_change:
                 quiet_since = quiet_since or now
                 if now - quiet_since >= quiet:
@@ -256,8 +275,8 @@ async def wait_for(
             what = {
                 "change": "the screen didn't change",
                 "stable": "the screen kept changing",
-                "text": f'"{text}" never appeared',
-                "text_gone": f'"{text}" was still on screen',
+                "text": "the requested text never appeared",
+                "text_gone": "the requested text was still on screen",
             }[until]
             return WaitResult(False, last, elapsed(), f"{what} within {timeout:g}s")
         if progress:
@@ -266,7 +285,7 @@ async def wait_for(
         previous = last
         try:
             last = await grab()
-        except Paused:
+        except (Paused, PolicyChanged):
             raise
         except ArgusError as exc:
             gone = f"the target went away ({exc})"
@@ -274,22 +293,22 @@ async def wait_for(
         polls += 1
 
 
-async def _settle(grab, shot: Shot, sleep, min_change: float, settle: float = 0.6, limit: float = 5.0) -> Shot:
+async def _settle(grab, shot: Shot, sleep, min_change: float, clock, settle: float = 0.6, limit: float = 5.0) -> Shot:
     """After a change, wait until consecutive frames agree (animations, repaints)."""
-    start = time.monotonic()
+    start = clock()
     current = shot
-    calm_since = time.monotonic()
-    while time.monotonic() - start < limit:
+    calm_since = clock()
+    while clock() - start < limit:
         await sleep(0.2)
         try:
             nxt = await grab()
-        except Paused:
+        except (Paused, PolicyChanged):
             raise
         except ArgusError:
             return current
         if diff(current.image, nxt.image).changed >= min_change:
-            calm_since = time.monotonic()
+            calm_since = clock()
         current = nxt
-        if time.monotonic() - calm_since >= settle:
+        if clock() - calm_since >= settle:
             break
     return current

@@ -37,14 +37,17 @@ def recent_files(limit: int, folder: Path | None = None) -> list[tuple[Path, flo
     return files[:limit]
 
 
-def clipboard_image() -> Image.Image | None:
+def clipboard_image(files: bool = True) -> Image.Image | None:
+    """The image on the clipboard. With *files* False, only an actual bitmap
+    counts: a list of copied files (CF_HDROP) is ignored, since it can point at
+    any image on disk - the work profile's clipboard-only mode uses that."""
     try:
         data = ImageGrab.grabclipboard()
     except Exception:  # clipboard locked by another app, odd formats...
         return None
     if isinstance(data, Image.Image):
         return data.convert("RGB")
-    if isinstance(data, list):  # files copied in Explorer
+    if isinstance(data, list) and files:  # files copied in Explorer
         for name in data:
             p = Path(name)
             if p.suffix.lower() in IMAGE_EXTS and p.is_file():
@@ -72,14 +75,26 @@ class Snip:
     when: float | None  # unknown for clipboard images copied before Argus started
 
 
-def latest(count: int = 1, clip_time: float | None = None, clip_seq: int | None = None, folder: Path | None = None) -> list[Snip]:
+def latest(
+    count: int = 1,
+    clip_time: float | None = None,
+    clip_seq: int | None = None,
+    folder: Path | None = None,
+    include_files: bool = True,
+    clipboard_files: bool | None = None,
+) -> list[Snip]:
     """Newest snips first. The clipboard image counts as a snip unless it's the
-    same picture as the newest saved one (a Win+Shift+S snip lands in both)."""
+    same picture as the newest saved one (a Win+Shift+S snip lands in both).
+
+    *include_files*: read the Screenshots folder. *clipboard_files*: open image
+    files copied in Explorer (a clipboard file list); defaults to
+    *include_files* for callers that don't separate the two."""
     count = max(1, min(count, 10))
-    files = recent_files(count, folder)
+    files = recent_files(count, folder) if include_files else []
     entries: list[tuple[float, Snip | tuple[Path, float]]] = [(mtime, (path, mtime)) for path, mtime in files]
 
-    clip = clipboard_image()
+    clip_files = include_files if clipboard_files is None else clipboard_files
+    clip = clipboard_image() if clip_files else clipboard_image(files=False)
     if clip is not None:
         newest = _open(files[0][0]) if files else None
         if newest is None or not same_image(clip, newest):

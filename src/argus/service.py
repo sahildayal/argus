@@ -10,22 +10,30 @@ from dataclasses import dataclass, field
 
 import anyio
 
-from . import ocr, privacy, testing
+from . import gate, ocr, privacy, testing
 from .capture import Shot, capture, capture_monitor, capture_window, recapture
 from .config import Settings, config_path, home, pretty_hotkey, settings
-from .desktop import ArgusError, Desktop, Host, Window, detect_host, snapshot
+from .desktop import ArgusError, Desktop, Host, PolicyChanged, Window, detect_host, snapshot
 from .focus import Tracker
 from .geometry import Rect
 from .imaging import render, side_by_side
 from .looking import ago, choose, host_label
-from .marks import recent_marks
+from .marks import Mark, recent_marks
 from .snips import latest as latest_snips, screenshots_dir
-from .store import Capture, Store, open_file
+from .store import Capture, Store, open_file, replayable
+from .text import display_arg
 
 
 @dataclass
 class Result:
     parts: list[str | Capture] = field(default_factory=list)
+    sources: list[Capture] = field(default_factory=list)
+    evidence: list[Shot] = field(default_factory=list)
+    mark_id: str | None = None
+    screen_derived: bool = True
+    window_scope: privacy.WindowSet | None = None
+    allow_trust: bool = True
+    query: str = ""
 
     def text(self, *lines: str) -> Result:
         self.parts.append("\n".join(line for line in lines if line))
@@ -38,6 +46,13 @@ class Result:
     @property
     def captures(self) -> list[Capture]:
         return [p for p in self.parts if isinstance(p, Capture)]
+
+    def approval_scope(self) -> tuple[privacy.WindowSet | None, bool]:
+        shots = [*(cap.shot for cap in self.sources + self.captures), *self.evidence]
+        windows = self.window_scope
+        if shots and all(shot.share_windows is not None for shot in shots):
+            windows = frozenset().union(*(shot.share_windows for shot in shots))
+        return windows, self.allow_trust and all(shot.allow_trust for shot in shots)
 
 
 def caption(cap: Capture) -> str:
@@ -72,12 +87,78 @@ def _looks_like_path(ref: str) -> bool:
     return any(c in ref for c in ":\\/") or ref.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".webp"))
 
 
+def _profile_ok(shot: Shot, s: Settings) -> bool:
+    """In the work profile, only images Argus redacted under the current work
+    policy may be shown again (see store.replayable)."""
+    return replayable(shot, s)
+
+
+def _require_profile(shot: Shot, s: Settings) -> None:
+    if not _profile_ok(shot, s):
+        raise ArgusError(
+            "The user's work profile is on, and that image wasn't taken under its current settings (it's from the "
+            "personal profile, from before the allowed apps changed, or isn't a capture Argus can vouch for), so Argus "
+            "won't show it. Take a fresh capture instead."
+        )
+
+
+def _mark_caption(mark: Mark, shot: Shot | None) -> tuple[str, float]:
+    """(what the mark shows, when it was made), from the sealed PNG metadata -
+    never from the mark's JSON sidecar, which isn't signed and could say
+    anything. An unsealed mark gets a generic caption (the work profile refuses
+    it anyway: without a seal it has no policy stamp)."""
+    if shot is not None and shot.sealed:
+        return shot.label, shot.taken
+    return "the marked area (its label couldn't be verified)", mark.when
+
+
+def _same_policy(s: Settings) -> None:
+    """End a multi-frame call if the profile or its allow/block lists changed
+    since it started: frames redacted under the old rules must not go out.
+    Only matters when the work profile is involved, before or after."""
+    now = settings()
+    if now.policy != s.policy and (s.work or now.work):
+        raise PolicyChanged(
+            "The user changed Argus's privacy profile or its allowed apps while this was running, so Argus stopped and "
+            "discarded what it had captured. Start again if it's still needed."
+        )
+
+
+class WatchApproval:
+    def __init__(self, start: gate.Policy, query: str, *, client: str | None = None, allow_trust: bool = True):
+        self.start = start
+        self.query = query
+        self.client = client
+        self.allow_trust = allow_trust
+        self.previous: Shot | None = None
+        self.changed = False
+
+    async def review_frame(self, shot: Shot) -> None:
+        await anyio.to_thread.run_sync(self._review, shot)
+
+    def _review(self, shot: Shot) -> None:
+        if gate.policy_changed(self.start):
+            gate.require(gate.request("wait_for", start=self.start, interrupted=True, client=self.client))
+        previous = self.previous
+        if previous is not None and (shot.share_windows is None or previous.share_windows != shot.share_windows):
+            # Review the previous set before a new frame can contribute to the result.
+            view, _ = render(previous.image, max_side=settings().max_side)
+            gate.require(gate.request(
+                "wait_for", (view.data,), windows=previous.share_windows, start=self.start,
+                watching=True, allow_trust=self.allow_trust and not self.changed and previous.allow_trust,
+                query=self.query, client=self.client,
+            ))
+            self.changed = True
+        self.previous = shot
+
+
 class Session:
-    def __init__(self, host: Host | None = None, track: bool = True):
+    def __init__(self, host: Host | None = None, track: bool = True, *, defer_marks: bool = False):
         self.host = host or detect_host()
         self.tracker = Tracker().start() if track else None
         self.store = Store()
         self.used_marks: set[str] = set()
+        self.defer_marks = defer_marks
 
     # -- plumbing ----------------------------------------------------------------
 
@@ -122,9 +203,14 @@ class Session:
         return result
 
     def capture_ref(self, ref: str | None) -> Capture:
+        s = settings()
         if ref and _looks_like_path(ref):
-            return self.register(open_file(ref.strip().strip('"')), save=False)
-        return self.store.get(ref)
+            shot = open_file(ref.strip().strip('"'), work=s.work)
+            _require_profile(shot, s)
+            return self.register(shot, save=False)
+        cap = self.store.get(ref)
+        _require_profile(cap.shot, s)
+        return cap
 
     # -- look --------------------------------------------------------------------
 
@@ -137,27 +223,50 @@ class Session:
             mark = marks[0] if marks else None
             if mark and mark.id not in self.used_marks and time.time() - mark.when <= s.mark_freshness:
                 shot = mark.shot(scope)
-                if shot is not None:
-                    self.used_marks.add(mark.id)
-                    what = mark.info.get("monitor" if scope == "monitor" else "window") or mark.info.get("monitor")
-                    result = Result().text(
-                        f"Using the hotkey mark you made {ago(time.time() - mark.when)} ago: {what}. "
+                what, when = _mark_caption(mark, shot)
+                if shot is not None and _profile_ok(shot, s) and time.time() - when <= s.mark_freshness:
+                    if not self.defer_marks:
+                        self.used_marks.add(mark.id)
+                    result = Result(mark_id=mark.id).text(
+                        f"Using the hotkey mark you made {ago(time.time() - when)} ago: {what}. "
                         "(look(fresh=true) captures live instead.)"
                     )
                     return self._show(result, [shot], grid)
 
         desk = self.desk()
-        choice = choose(desk, self.history())
+
+        def name(w: Window) -> str:
+            return privacy.display_name(w, s)
+
+        history = self.history()
+        # Work profile: only windows it actually shows (allowed and not on the
+        # block list) can be picked or offered as alternatives.
+        choice = choose(desk, history, (lambda w: privacy.shown(w, s)) if s.work else None)
         footer = []
+        notice = ""
+        if s.work:
+            likely = choose(desk, history).window
+            if likely is not None and not privacy.shown(likely, s):
+                notice = (
+                    f"The window the user was most likely looking at, {name(likely)}, isn't allowed by their work "
+                    "profile, so Argus won't show it."
+                )
         if choice.host is not None:
-            footer.append(f"Skipped {choice.host.label}: that's the window you're chatting with me in.")
+            footer.append(f"Skipped {name(choice.host)}: that's the window you're chatting with me in.")
         if choice.alternatives:
             alts = "; ".join(
-                f"{why}: {w.label}" + (f" on Monitor {w.monitor}" if w.monitor else "") + f" [{w.handle}]"
+                f"{why}: {name(w)}" + (f" on Monitor {w.monitor}" if w.monitor else "") + f" [{w.handle}]"
                 for why, w in choice.alternatives
             )
             footer.append(f"Other candidates - {alts}. If I picked the wrong one, use screenshot(window=\"<handle>\").")
 
+        if choice.window is None and s.work:
+            raise ArgusError(
+                " ".join(
+                    filter(None, [notice, "No window the work profile allows is open (other than this chat). Tell the "
+                                  "user; only they can allow apps (under [work] in ~/.argus/config.toml)."] + footer)
+                )
+            )
         if choice.window is None:
             mon = desk.cursor_monitor
             result = Result().text(f"No other app window is open, so here is the monitor the mouse is on ({mon.title}).")
@@ -168,14 +277,19 @@ class Session:
         if scope == "monitor":
             mon = desk.monitor(win.monitor) if win.monitor else desk.cursor_monitor
             shot = capture_monitor(desk, mon, s)
-            header = f"{mon.title}, the monitor showing {win.label}. Picked because {choice.reason}."
+            header = f"{mon.title}, the monitor showing {name(win)}. Picked because {choice.reason}."
         else:
             try:
                 shot = capture_window(desk, win, s)
             except ArgusError as exc:
                 raise ArgusError(f"{exc} {' '.join(footer)}") from None
-            header = f"Picked {win.label} because {choice.reason}."
-        result = Result().text(header)
+            header = f"Picked {name(win)} because {choice.reason}."
+        result = Result().text(notice, header)
+        extra = [w for _, w in choice.alternatives]
+        if choice.host is not None:
+            extra.append(choice.host)
+        if shot.share_windows is not None:
+            result.allow_trust = privacy.named_windows([win, *extra], s) <= shot.share_windows
         self._show(result, [shot], grid)
         return result.text(*footer)
 
@@ -229,8 +343,11 @@ class Session:
             monitor=cap.shot.monitor,
             window=cap.shot.window,
             taken=cap.shot.taken,
+            profile=cap.shot.profile,
+            share_windows=cap.shot.share_windows,
+            policy=cap.shot.policy,
         )
-        return Result().add(self.register(shot, grid=grid, upscale_to=1200))
+        return Result(sources=[cap], allow_trust=False).add(self.register(shot, grid=grid, upscale_to=1200))
 
     # -- list --------------------------------------------------------------------------
 
@@ -239,10 +356,15 @@ class Session:
         from . import __version__
 
         if state.paused:
-            return Result().text(f"Argus {__version__}: {state.describe()} by the user. Nothing can be listed or captured until they resume it.")
+            return Result(screen_derived=False).text(f"Argus {__version__}: {state.describe()} by the user. Nothing can be listed or captured until they resume it.")
         s = settings()
         desk = self.desk()
-        lines = [f"Argus {__version__}: captures {state.describe()}. You're chatting from: {host_label(desk)}."]
+        lines = [f"Argus {__version__}: captures {state.describe()}, {s.profile} profile. You're chatting from: {host_label(desk)}."]
+        if s.work:
+            lines.append(
+                "Work profile: only the apps the user allowed are visible. Everything else (other windows, the desktop, "
+                "the taskbar) is blacked out in captures, and hidden windows are listed without their titles."
+            )
         cm = desk.cursor_monitor
         lines.append(f"Mouse at ({desk.cursor[0]}, {desk.cursor[1]}), on {cm.title}.")
         lines.append("")
@@ -272,12 +394,12 @@ class Session:
             lines.append(f"On the privacy list (blacked out in captures): {', '.join(hidden)}.")
         for problem in s.problems:
             lines.append(f"Config problem: {problem}")
-        return Result().text(*lines)
+        scope = privacy.named_windows(desk.windows, s) if s.requires_approval else None
+        return Result(window_scope=scope).text(*lines)
 
     @staticmethod
     def _safe_label(w: Window, s: Settings) -> str:
-        reason = privacy.sensitive_reason(w, s)
-        return f"{w.app or w.process} (title hidden, privacy list)" if reason else w.label
+        return privacy.display_name(w, s)
 
     def _window_line(self, w: Window, desk: Desktop, s: Settings) -> str:
         tags = []
@@ -297,21 +419,44 @@ class Session:
     # -- the user's own captures -------------------------------------------------------
 
     def latest_snip(self, count: int = 1, grid: bool | None = None) -> Result:
-        self.guard()
-        tr = self.tracker
-        snips = latest_snips(count, tr.clip_time if tr else None, tr.clip_seq if tr else None)
-        if not snips:
+        s = self.guard()
+        if s.lockdown:
             raise ArgusError(
-                f"No snips found: the clipboard holds no image and {screenshots_dir()} has no screenshots. "
+                "Argus's settings file has a problem, so the work profile is locked down and won't share snips at all. "
+                "Tell the user; `argus status` shows what to fix."
+            )
+        tr = self.tracker
+        # Snips can't be redacted (Argus doesn't know what windows they show), so
+        # the work profile skips the Screenshots folder and copied files unless
+        # the user opted in to each separately.
+        files = not s.work or s.allow_snip_folder
+        clip_files = not s.work or s.allow_clipboard_files
+        snips = latest_snips(count, tr.clip_time if tr else None, tr.clip_seq if tr else None, include_files=files,
+                             clipboard_files=clip_files)
+        if not snips:
+            if not files:
+                raise ArgusError(
+                    "No snip on the clipboard. The work profile doesn't read the Screenshots folder, so the user has to "
+                    "copy the snip (Win+Shift+S puts it on the clipboard)."
+                )
+            folder = "the Screenshots folder" if s.work else str(screenshots_dir())
+            raise ArgusError(
+                f"No snips found: the clipboard holds no image and {folder} has no screenshots. "
                 "The user can snip with Win+Shift+S."
             )
         shots = []
         for sn in snips:
             when = f"{ago(time.time() - sn.when)} ago" if sn.when else "before Argus started watching the clipboard"
-            what = f"saved snip {sn.path.name}" if sn.path else "image on the clipboard"
+            if sn.path:
+                what = "saved snip" if s.work else f"saved snip {sn.path.name}"
+            else:
+                what = "image on the clipboard"
+            # A snip is an image of unknown origin: it's never stamped with a
+            # policy (nor sealed as one when saved), so it can't later be replayed
+            # from disk as a verified work capture. The gate still previews it.
             shots.append(
                 Shot(image=sn.image, kind="snip", label=f"{what}, from {when}", origin=None, target={}, method=sn.source,
-                     taken=sn.when or time.time(), source=sn.path)
+                     taken=sn.when or time.time(), source=sn.path, profile="", policy="")
             )
         result = Result()
         if len(shots) > 1:
@@ -330,9 +475,16 @@ class Session:
         shot = mark.shot(scope)
         if shot is None:
             raise ArgusError("The latest mark's image files are missing (cleaned up or deleted).")
-        self.used_marks.add(mark.id)
-        what = mark.info.get("monitor" if scope == "monitor" else "window") or mark.info.get("monitor")
-        result = Result().text(f"Hotkey mark from {ago(time.time() - mark.when)} ago: {what}.")
+        if not _profile_ok(shot, s):
+            raise ArgusError(
+                "The latest mark wasn't made under the user's current work profile settings (it predates switching to "
+                "work or changing the allowed apps), so Argus won't share it. "
+                f"They can mark again with {pretty_hotkey(s.hotkey_mark)}."
+            )
+        if not self.defer_marks:
+            self.used_marks.add(mark.id)
+        what, when = _mark_caption(mark, shot)
+        result = Result(mark_id=mark.id).text(f"Hotkey mark from {ago(time.time() - when)} ago: {what}.")
         return self._show(result, [shot], grid)
 
     # -- OCR ---------------------------------------------------------------------------
@@ -346,8 +498,9 @@ class Session:
 
     async def read_text(self, monitor=None, window=None, region=None, capture_id=None, positions: bool = True) -> Result:
         self.guard()
-        result = Result()
-        for cap in await self._ocr_targets(monitor, window, region, capture_id):
+        caps = await self._ocr_targets(monitor, window, region, capture_id)
+        result = Result(sources=caps, allow_trust=False)
+        for cap in caps:
             lines = await ocr.read(cap.image)
             head = f"[{cap.id}] Text in {cap.shot.label}"
             if positions:
@@ -361,15 +514,17 @@ class Session:
         self.guard()
         found: list[tuple[Capture, ocr.Match]] = []
         first_lines: list[ocr.Line] = []
-        for cap in await self._ocr_targets(monitor, window, region, capture_id):
+        caps = await self._ocr_targets(monitor, window, region, capture_id)
+        result = Result(sources=caps, query=display_arg(text), allow_trust=False)
+        for cap in caps:
             lines = await ocr.read(cap.image)
             first_lines = first_lines or lines
             found.extend((cap, m) for m in ocr.find(lines, text))
         if not found:
             sample = "; ".join(ln.text for ln in first_lines[:12]) or "nothing legible"
-            return Result().text(f'"{text}" is not on screen (OCR). Text it did read includes: {sample}.')
+            return result.text(f"No matches on screen (OCR). Text it did read includes: {sample}.")
         found.sort(key=lambda cm: -cm[1].score)
-        lines = [f'Found "{text}" {len(found)} time(s):']
+        lines = [f"Found {len(found)} {'match' if len(found) == 1 else 'matches'}:"]
         for i, (cap, m) in enumerate(found[:10], 1):
             sc = cap.view.scale
             x0, y0, x1, y1 = (round(v * sc) for v in m.box)
@@ -390,46 +545,52 @@ class Session:
         bx1, by1 = min(img.width, int(best.box[2]) + pad), min(img.height, int(best.box[3]) + pad)
         origin = (cap.shot.origin[0] + bx0, cap.shot.origin[1] + by0) if cap.shot.origin else None
         crop = Shot(
-            image=img.crop((bx0, by0, bx1, by1)), kind="zoom", label=f'best match for "{text}" (from {cap.id})',
+            image=img.crop((bx0, by0, bx1, by1)), kind="zoom", label=f"best OCR match (from {cap.id})",
             origin=origin, target={}, method="crop", cursor=cap.shot.cursor, taken=cap.shot.taken,
+            share_windows=cap.shot.share_windows,
+            profile=cap.shot.profile, policy=cap.shot.policy,
         )
         box = (best.box[0] - bx0, best.box[1] - by0, best.box[2] - bx0, best.box[3] - by0)
-        result = Result().text(*lines)
-        return result.add(self.register(crop, grid=False, boxes=[box], upscale_to=900))
+        return result.text(*lines).add(self.register(crop, grid=False, boxes=[box], upscale_to=900))
 
     # -- testing -------------------------------------------------------------------------
 
-    def save_baseline(self, name: str, monitor=None, window=None, region=None) -> Result:
+    def save_baseline(self, name: str, monitor=None, window=None, region=None, *, local_receipt: bool = False) -> Result:
         s = self.guard()
         shots = capture(self.desk(), s, monitor, window, region)
         if len(shots) != 1:
             raise ArgusError("A baseline is one monitor, window or region, not 'all'.")
         shot = shots[0]
         path = testing.save_baseline(name, shot)
+        if local_receipt:
+            return Result(screen_derived=False).text(f"Saved baseline {path.stem!r}.")
         cap = self.register(shot, grid=False, save=False)
         w, h = shot.image.size
+        shown_name = display_arg(name)
         return Result().text(
-            f"Saved baseline {name!r}: {shot.label}, {w}x{h} [{cap.id}].",
+            f"Saved baseline {shown_name!r}: {shot.label}, {w}x{h} [{cap.id}].",
             f"File: {path}",
-            f'Later, compare(baseline="{name}") re-captures the same target and boxes what changed.',
+            f'Later, compare(baseline="{path.stem}") re-captures the same target and boxes what changed.',
         )
 
     def compare(self, baseline: str | None = None, capture_a: str | None = None, capture_b: str | None = None,
                 ignore=None, threshold: int = 24, show: str = "after") -> Result:
         s = self.guard()
         if baseline:
-            before = testing.load_baseline(baseline)
+            before = testing.load_baseline(baseline, s)
+            _require_profile(before, s)
             after = recapture(self.desk(), s, before.target)
-            name_before = f"baseline {baseline!r} (saved {ago(time.time() - before.taken)} ago)"
+            name_before = f"baseline {display_arg(baseline)!r} (saved {ago(time.time() - before.taken)} ago)"
         elif capture_a:
             before = self.capture_ref(capture_a).shot
             if capture_b:
                 after = self.capture_ref(capture_b).shot
             else:
                 if not before.target:
-                    raise ArgusError(f"{capture_a} can't be re-taken (snip, mark or file); pass capture_b too.")
+                    which = "That capture" if s.work else display_arg(capture_a)  # it may be a file path
+                    raise ArgusError(f"{which} can't be re-taken (snip, mark or file); pass capture_b too.")
                 after = recapture(self.desk(), s, before.target)
-            name_before = f"{capture_a} ({ago(time.time() - before.taken)} ago)"
+            name_before = f"{display_arg(capture_a)} ({ago(time.time() - before.taken)} ago)"
         else:
             raise ArgusError('Pass baseline="name", or capture_a (and optionally capture_b).')
 
@@ -440,20 +601,26 @@ class Session:
             except (TypeError, ValueError):
                 raise ArgusError("ignore takes a list of [x, y, width, height] boxes") from None
         d = testing.diff(before.image, after.image, threshold=max(0, min(int(threshold), 255)), ignore=rects)
+        _same_policy(s)
+        result = Result(evidence=[before, after])
         if d.changed == 0:
             cap = self.register(after, grid=False)
-            return Result().text(f"No visible change between {name_before} and now [{cap.id}]." + (f" {d.note}" if d.note else ""))
+            return result.text(f"No visible change between {name_before} and now [{cap.id}]." + (f" {d.note}" if d.note else ""))
 
         # Regions are in `before` pixels; map them onto `after` if its size differs.
         sx, sy = after.image.width / before.image.width, after.image.height / before.image.height
         boxes = [(r.x * sx, r.y * sy, r.right * sx, r.bottom * sy) for r in d.regions]
-        result = Result()
         if show == "both":
             half = (s.max_side - 12) // 2  # the pair fits in one max_side-wide image
             _lv, left = render(before.image, max_side=half)
             right_view, right = render(after.image, max_side=half, boxes=boxes)
             combo = side_by_side(left, right, labels=(name_before, "now (changes boxed)"))
-            shot = Shot(image=combo, kind="compare", label=f"{name_before} vs now", origin=None, target={}, method="composite")
+            scope = None
+            if before.share_windows is not None and after.share_windows is not None:
+                scope = before.share_windows | after.share_windows
+            shot = Shot(image=combo, kind="compare", label=f"{name_before} vs now", origin=None, target={}, method="composite",
+                        profile=after.profile, share_windows=scope,
+                        policy=after.policy if before.policy == after.policy else "")
             cap = self.register(shot, grid=False)
             sc, cs = right_view.scale, cap.view.scale
             ox, oy = left.width + 12, 26
@@ -471,7 +638,8 @@ class Session:
         return result.add(cap)
 
     async def wait_for(self, until: str, text: str | None = None, monitor=None, window=None, region=None,
-                       timeout: float = 30.0, progress: Callable[[float, float, str], Awaitable[None]] | None = None) -> Result:
+                       timeout: float = 30.0, progress: Callable[[float, float, str], Awaitable[None]] | None = None,
+                       *, approve_frame: Callable[[Shot], Awaitable[None]] | None = None) -> Result:
         s = self.guard()
         timeout = max(1.0, min(float(timeout), 600.0))
         shots = await anyio.to_thread.run_sync(lambda: capture(self.desk(), s, monitor, window, region))
@@ -479,26 +647,45 @@ class Session:
             raise ArgusError("wait_for watches one monitor, window or region, not 'all'.")
         pending = [shots[0]]
         target = shots[0].target
+        approval_time = 0.0
 
         async def grab() -> Shot:
+            nonlocal approval_time
             privacy.ensure_not_paused()
+            # Every frame re-checks the profile: if it (or its lists) changed,
+            # the frames taken so far are dropped and the wait ends.
+            _same_policy(s)
             if pending:
-                return pending.pop()
-            return await anyio.to_thread.run_sync(lambda: recapture(self.desk(), settings(), target))
+                shot = pending.pop()
+            else:
+                try:
+                    shot = await anyio.to_thread.run_sync(lambda: recapture(self.desk(), settings(), target))
+                except ArgusError:
+                    if approve_frame is not None:
+                        raise ArgusError("The target can no longer be captured.") from None
+                    raise
+            if approve_frame is not None:
+                requested_at = time.monotonic()
+                await approve_frame(shot)
+                approval_time += time.monotonic() - requested_at
+            return shot
 
         async def report(elapsed: float, message: str) -> None:
             if progress is not None:
                 await progress(elapsed, timeout, message)
 
         outcome = await testing.wait_for(
-            grab, until, text=text, read=ocr.read, find=ocr.find, timeout=timeout, progress=report
+            grab, until, text=text, read=ocr.read, find=ocr.find, timeout=timeout, progress=report,
+            clock=lambda: time.monotonic() - approval_time,
         )
+        _same_policy(s)  # the last frame may predate a switch made during OCR / settling
         boxes = None
         if outcome.matches:
             boxes = [m.box for m in outcome.matches[:5]]
         elif outcome.diff is not None and outcome.diff.regions:
             boxes = [r.ltrb_tuple() for r in outcome.diff.regions[:8]]
-        result = Result().text(("Done: " if outcome.ok else "Timed out: ") + f"{outcome.detail} after {outcome.elapsed:.1f}s.")
+        query = display_arg(text) if text and until in ("text", "text_gone") else ""
+        result = Result(query=query).text(("Done: " if outcome.ok else "Timed out: ") + f"{outcome.detail} after {outcome.elapsed:.1f}s.")
         if outcome.shot is not None:
             result.add(self.register(outcome.shot, grid=False, boxes=boxes))
         return result
@@ -512,9 +699,13 @@ def status_text() -> str:
     return "\n".join(
         [
             f"Argus {__version__}: {state.describe()}",
+            f"Profile: {s.profile}" + (" (only allowed apps are visible)" if s.work else " (everything but the privacy list is visible)"),
+            *([f"Why work: {s.profile_reason}" + (" - and nothing is allowed until config.toml is fixed" if s.lockdown else "") + "."]
+              if s.work and s.profile_reason else []),
             f"Data: {home()}",
             f"Settings: {config_path()}",
             f"Hotkeys: mark {pretty_hotkey(s.hotkey_mark)}, pause {pretty_hotkey(s.hotkey_pause)} (tray app)",
             f"Captures are deleted after {s.retention_days:g} days.",
+            *(f"Config problem: {p}" for p in s.problems),
         ]
     )
